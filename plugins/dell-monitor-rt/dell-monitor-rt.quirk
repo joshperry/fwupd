@@ -1,15 +1,22 @@
-# Dell U4025QW USB-HID interfaces (RealTek RTS5409S upstream hub MCU).
-# These two interfaces are the firmware update endpoints — both belong
-# to the same physical monitor; the plugin treats them as a single
-# logical device.
+# Dell U4025QW — upstream hub MCU's HID interface (DEV_1100).
 #
 # Match by the hidraw VID:DEV pair (kernel HID enumeration), not by USB
 # VID:PID, so all I/O goes through the kernel hid-generic driver — the
 # same path Dell's hidapi-based binary uses.
+#
+# The U4025QW exposes two HID interfaces (DEV_1100 and DEV_1101) on
+# different USB sub-paths of its internal hub. They are *not* the same
+# chip:
+#   - DEV_1100: RTS5409S upstream hub MCU. Supports the cal_auth
+#     handshake, opens an I²C tunnel to the FL5500 scaler, and is the
+#     interface through which the M3T105 firmware update flows. This
+#     is what we match here.
+#   - DEV_1101: a secondary MCU (its hub MCU version reads as 2.06 vs
+#     1100's 2.04, confirming distinct firmware). Its cal_auth-style
+#     handshake STALLs, suggesting a different protocol gate. We don't
+#     yet know its update path. Adding support is a separate task — we
+#     just don't enumerate it here, which keeps fwupd's device list
+#     clean to one logical entry per monitor.
 [HIDRAW\VEN_0BDA&DEV_1100]
 Plugin = dell_monitor_rt
-Name = U4025QW (HID-A)
-
-[HIDRAW\VEN_0BDA&DEV_1101]
-Plugin = dell_monitor_rt
-Name = U4025QW (HID-B)
+Name = U4025QW
