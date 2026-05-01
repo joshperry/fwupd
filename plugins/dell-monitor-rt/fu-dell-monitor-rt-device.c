@@ -10,43 +10,48 @@
 #include "fu-dell-monitor-rt-device.h"
 
 /*
- * Wire format (decoded from the Wistron updater's libdevices.so source):
+ * Wire format (verified against captured pcap frame 7700 of Dell's own
+ * updater talking to the same monitor):
  *
  *   byte 0     direction      0x40 = WRITE   / 0xC0 = READ
  *   byte 1     opcode         (see DELL_MONITOR_RT_OPCODE_* below)
- *   byte 2     subcmd
- *   byte 3     arg
- *   bytes 4    pad (zero)
- *   bytes 5-6  vendor sig     0xDA 0x0B  (RealTek vendor ID 0x0BDA, LE)
- *   byte 7     pad (zero)
+ *   byte 2     subcmd / arg   (command-specific)
+ *   byte 3     arg            (command-specific, often zero)
+ *   bytes 4-5  vendor sig     0xDA 0x0B  (RealTek vendor ID 0x0BDA, LE)
+ *                             — present on vendor-cmd-mode framings; some
+ *                             other opcodes (e.g. SRAM write) put data here
+ *   bytes 6-7  pad (zero)
  *   bytes 8+   payload        (firmware data for SRAM_WRITE; otherwise zero)
  *
- * Sent as a HID Output Report (SET_REPORT class control transfer) with
- * a fixed 192-byte size.
+ * Sent as a HID Output Report (kernel HID stack issues the SET_REPORT
+ * class control transfer) with a fixed 192-byte size.  When write(2)-ing
+ * to /dev/hidrawN, byte 0 of the buffer is the Report ID — this device
+ * declares no Report ID, so byte 0 is always 0x00 and the 192 actual
+ * report bytes follow, giving a 193-byte transfer.
  */
 
-#define DELL_MONITOR_RT_REPORT_SIZE   192
-#define DELL_MONITOR_RT_REPORT_ID     0x00
-#define DELL_MONITOR_RT_TIMEOUT_MS    5000
+#define DELL_MONITOR_RT_REPORT_SIZE  192
+#define DELL_MONITOR_RT_TIMEOUT_MS   5000
 
-#define DELL_MONITOR_RT_DIR_WRITE     0x40
-#define DELL_MONITOR_RT_DIR_READ      0xC0
+#define DELL_MONITOR_RT_DIR_WRITE    0x40
+#define DELL_MONITOR_RT_DIR_READ     0xC0
 
-#define DELL_MONITOR_RT_OPCODE_ENABLE_VDCMD 0x02
-#define DELL_MONITOR_RT_OPCODE_GET_VERSION  0x10  /* hypothesis — needs runtime confirm */
+#define DELL_MONITOR_RT_OPCODE_ENABLE_VDCMD          0x02
+#define DELL_MONITOR_RT_OPCODE_ENABLE_HIGH_CLOCK     0x06
 
 #define DELL_MONITOR_RT_VENDOR_SIG_LO 0xDA
 #define DELL_MONITOR_RT_VENDOR_SIG_HI 0x0B
 
 struct _FuDellMonitorRtDevice {
-	FuHidDevice parent_instance;
+	FuHidrawDevice parent_instance;
 };
 
-G_DEFINE_TYPE(FuDellMonitorRtDevice, fu_dell_monitor_rt_device, FU_TYPE_HID_DEVICE)
+G_DEFINE_TYPE(FuDellMonitorRtDevice, fu_dell_monitor_rt_device, FU_TYPE_HIDRAW_DEVICE)
 
 /*
- * Build the standard 192-byte vendor frame and send it as a SET_REPORT.
- * Optionally pulls back the device's response via GET_REPORT.
+ * Build the standard 192-byte vendor frame and write it to the device's
+ * hidraw fd.  Goes through the kernel's hid-generic driver, which is
+ * what hidapi (and therefore Dell's official .deb updater) uses too.
  */
 static gboolean
 fu_dell_monitor_rt_device_vcmd(FuDellMonitorRtDevice *self,
@@ -56,10 +61,9 @@ fu_dell_monitor_rt_device_vcmd(FuDellMonitorRtDevice *self,
 			       guint8 arg,
 			       const guint8 *payload,
 			       gsize payload_len,
-			       guint8 *response,
 			       GError **error)
 {
-	guint8 buf[DELL_MONITOR_RT_REPORT_SIZE] = {0};
+	guint8 buf[1 + DELL_MONITOR_RT_REPORT_SIZE] = {0};
 
 	if (payload_len > DELL_MONITOR_RT_REPORT_SIZE - 8) {
 		g_set_error(error,
@@ -71,40 +75,24 @@ fu_dell_monitor_rt_device_vcmd(FuDellMonitorRtDevice *self,
 		return FALSE;
 	}
 
-	buf[0] = dir;
-	buf[1] = opcode;
-	buf[2] = subcmd;
-	buf[3] = arg;
-	/* buf[4] left zero */
+	/* buf[0] is the Report ID prefix (always 0 — device declares none) */
+	buf[1] = dir;
+	buf[2] = opcode;
+	buf[3] = subcmd;
+	buf[4] = arg;
 	buf[5] = DELL_MONITOR_RT_VENDOR_SIG_LO;
 	buf[6] = DELL_MONITOR_RT_VENDOR_SIG_HI;
-	/* buf[7] left zero */
+	/* buf[7] and buf[8] left zero */
 	if (payload != NULL && payload_len > 0)
-		memcpy(buf + 8, payload, payload_len);
+		memcpy(buf + 1 + 8, payload, payload_len);
 
-	if (!fu_hid_device_set_report(FU_HID_DEVICE(self),
-				      DELL_MONITOR_RT_REPORT_ID,
-				      buf,
-				      sizeof(buf),
-				      DELL_MONITOR_RT_TIMEOUT_MS,
-				      FU_HID_DEVICE_FLAG_NONE,
-				      error))
-		return FALSE;
+	fu_dump_raw(G_LOG_DOMAIN, "vcmd write", buf, sizeof(buf));
 
-	if (response != NULL) {
-		guint8 in[DELL_MONITOR_RT_REPORT_SIZE] = {0};
-		if (!fu_hid_device_get_report(FU_HID_DEVICE(self),
-					      DELL_MONITOR_RT_REPORT_ID,
-					      in,
-					      sizeof(in),
-					      DELL_MONITOR_RT_TIMEOUT_MS,
-					      FU_HID_DEVICE_FLAG_NONE,
-					      error))
-			return FALSE;
-		memcpy(response, in, DELL_MONITOR_RT_REPORT_SIZE);
-	}
-
-	return TRUE;
+	return fu_hidraw_device_set_report(FU_HIDRAW_DEVICE(self),
+					   buf,
+					   sizeof(buf),
+					   FU_IO_CHANNEL_FLAG_NONE,
+					   error);
 }
 
 static gboolean
@@ -124,13 +112,9 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 
 	/*
 	 * Smoke test: send the enable_vdcmd (opcode 0x02) ping that the
-	 * captured update sequence opens with. If the device acknowledges,
-	 * we know the wire format and HID-class control transfer plumbing
-	 * are working end-to-end.
-	 *
-	 * The captured frame at pcap timestamp 23.6 s was:
-	 *   40 02 01 00 00 DA 0B 00 (rest zero) — direction WRITE,
-	 *   opcode enable_vdcmd, subcmd 0x01.
+	 * captured update sequence opens with.  See PLUGIN_NOTES §
+	 * "Per-phase timeline" — Dell's binary issues this immediately on
+	 * device open before doing anything else.
 	 */
 	if (!fu_dell_monitor_rt_device_vcmd(self,
 					    DELL_MONITOR_RT_DIR_WRITE,
@@ -139,7 +123,6 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 					    0x00,
 					    NULL,
 					    0,
-					    NULL,
 					    &error_local)) {
 		g_warning("dell-monitor-rt: enable_vdcmd ping failed: %s",
 			  error_local->message);
@@ -147,9 +130,6 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 		return TRUE; /* don't fail device setup; just record state */
 	}
 
-	/* TODO: send a real version-read opcode and parse the response.
-	 * For now record that the ping succeeded so downstream tooling
-	 * sees a distinct version string. */
 	fu_device_set_version(device, "0.0.0-vcmd-ack");
 	return TRUE;
 }
@@ -164,6 +144,13 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 	fu_device_add_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_UPDATABLE);
 	fu_device_add_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_SIGNED_PAYLOAD);
 	fu_device_set_remove_delay(FU_DEVICE(self), 60 * 1000); /* 60 s for re-enum */
+
+	/* Declare hidraw FD open mode so fu_udev_device_open() actually
+	 * opens the descriptor in r/w; otherwise writes fail with EBADF. */
+	fu_udev_device_add_open_flag(FU_UDEV_DEVICE(self),
+				     FU_IO_CHANNEL_OPEN_FLAG_READ);
+	fu_udev_device_add_open_flag(FU_UDEV_DEVICE(self),
+				     FU_IO_CHANNEL_OPEN_FLAG_WRITE);
 }
 
 static void

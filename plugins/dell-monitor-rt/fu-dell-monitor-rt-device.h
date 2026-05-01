@@ -14,4 +14,4 @@ G_DECLARE_FINAL_TYPE(FuDellMonitorRtDevice,
 		     fu_dell_monitor_rt_device,
 		     FU,
 		     DELL_MONITOR_RT_DEVICE,
-		     FuHidDevice)
+		     FuHidrawDevice)

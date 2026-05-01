@@ -1,11 +1,15 @@
-# Dell U4025QW USB-HID interfaces (RealTek RTS5409S upstream hub MCU)
+# Dell U4025QW USB-HID interfaces (RealTek RTS5409S upstream hub MCU).
 # These two interfaces are the firmware update endpoints — both belong
 # to the same physical monitor; the plugin treats them as a single
 # logical device.
-[USB\VID_0BDA&PID_1100]
+#
+# Match by the hidraw VID:DEV pair (kernel HID enumeration), not by USB
+# VID:PID, so all I/O goes through the kernel hid-generic driver — the
+# same path Dell's hidapi-based binary uses.
+[HIDRAW\VEN_0BDA&DEV_1100]
 Plugin = dell_monitor_rt
 Name = U4025QW (HID-A)
 
-[USB\VID_0BDA&PID_1101]
+[HIDRAW\VEN_0BDA&DEV_1101]
 Plugin = dell_monitor_rt
 Name = U4025QW (HID-B)
