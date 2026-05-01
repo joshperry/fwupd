@@ -159,13 +159,17 @@ fu_dell_monitor_rt_device_vcmd_read(FuDellMonitorRtDevice *self,
 /*
  * Read the upstream-hub MCU's firmware version. Mirrors
  * RTS5409S_HID::get_self_fw_version() in libdevices.so:
- *   - send  C0 09 00 00 00 00 20 …
- *   - read  193 bytes back
- *   - format response[0x12]<<bytes_we_dont_decode_yet> as the
- *     reported firmware version string
+ *   - send  C0 09 00 00 00 00 20 …  (HID Output Report, opcode 0x09)
+ *   - pull  193-byte HID Input Report via HIDIOCGINPUT
+ *   - format response[11..12] as "%X.%02X" (the format string in
+ *     Dell's binary at libdevices.so .rodata + 0x1d1ecc)
  *
- * For now we just stash the first 16 hex bytes of the response into the
- * version string so we can see what comes back and iterate from there.
+ * NOTE: this returns the *hub MCU's* (RealTek RTS5409S) internal
+ * firmware revision, NOT the user-facing "M3T105" version that the
+ * Dell GUI shows. M3T105 lives on the FL5500 scaler chip and is
+ * readable via the I²C tunnel (Rts5409s_IIC_API::read_fw_version
+ * reads register 0x0325 over the HID-encoded I²C bus). That's a
+ * separate code path we'll add once the basic write loop works.
  */
 static gboolean
 fu_dell_monitor_rt_device_read_version(FuDellMonitorRtDevice *self,
@@ -197,7 +201,8 @@ fu_dell_monitor_rt_device_read_version(FuDellMonitorRtDevice *self,
 	{
 		guint8 minor = response[1 + 0x0B];
 		guint8 major = response[1 + 0x0C];
-		*version_out = g_strdup_printf("%u.%u", major, minor);
+		/* Dell's binary uses "%X.%02X" — version is hex-formatted */
+		*version_out = g_strdup_printf("hub-%X.%02X", major, minor);
 	}
 	return TRUE;
 }
