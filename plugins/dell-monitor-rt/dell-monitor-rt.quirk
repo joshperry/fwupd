@@ -4,6 +4,8 @@
 # logical device.
 [USB\VID_0BDA&PID_1100]
 Plugin = dell_monitor_rt
+Name = U4025QW (HID-A)
 
 [USB\VID_0BDA&PID_1101]
 Plugin = dell_monitor_rt
+Name = U4025QW (HID-B)
