@@ -545,16 +545,21 @@ fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 					      gchar **version_out,
 					      GError **error)
 {
-	/* Replay of Dell's first phase-1 register read (frame 7710 of the
-	 * captured pcap). Wrapped in DDC/CI: source addr (host) = 0x51,
-	 * length byte 0x80|4 = 0x84, then 4 cmd bytes, then XOR checksum
-	 * over 0x6E (dest), 0x51, 0x84, and the cmd bytes. In Dell's run
-	 * this returned the ASCII string "753.0AK01.0007" — almost
-	 * certainly an EDID/panel-ID value, not the M3T105 version, but
-	 * it's the smoke-test that proves the I²C tunnel works end-to-end
-	 * since we can compare against the captured response byte-for-byte. */
+	/* DDC/CI vendor command 0xC0/0x99 with selector 0xCC/0x20 — reads
+	 * the user-facing firmware version string from the FL5500 scaler.
+	 * For the U4025QW running pre-update this returns "M3T105", the
+	 * Dell-branded version identifier shown in DDPM and the .deb GUI.
+	 *
+	 * Wire layout (DDC/CI):
+	 *   51 84 c0 99 cc 20 0e
+	 *   │  │  └─────┬────┘ │
+	 *   │  │       cmd     XOR-checksum over 0x6E (dest) || all preceding
+	 *   │  length: 0x80 | (number of cmd bytes = 4)
+	 *   src addr (host = 0x51)
+	 *
+	 * Frame 10778 of captures/u4025qw-m3t105-update-171436.pcapng. */
 	const guint8 i2c_request[7] = {
-	    0x51, 0x84, 0xc0, 0x99, 0xee, 0x20, 0x2c,
+	    0x51, 0x84, 0xc0, 0x99, 0xcc, 0x20, 0x0e,
 	};
 	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
 	guint8 hub_key[8];
@@ -618,8 +623,7 @@ fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 					if (wire[i] >= 0x20 && wire[i] < 0x7f)
 						g_string_append_c(ascii, wire[i]);
 				}
-				*version_out = g_strdup_printf("scaler-%s",
-							       ascii->str);
+				*version_out = g_strdup(ascii->str);
 				return TRUE;
 			}
 		}
@@ -694,27 +698,26 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 
 	g_debug("dell-monitor-rt: hub MCU firmware version = %s", version);
 
-	/* Step 4: I²C-tunnel READ test — pull the FL5500 scaler chip's
-	 * own internal version string. This proves the I²C tunnel
-	 * primitives work end-to-end, which is the same path we'll use
-	 * for the actual flash writes / erases / status polls. */
+	/* Step 4: read the user-facing firmware version (e.g. "M3T105")
+	 * via DDC/CI command 0xC0/0x99 selector 0xCC/0x20. This is the
+	 * version Dell's GUI displays and what fwupd will compare against
+	 * LVFS metadata. The hub MCU version from step 3 is internal
+	 * (logged for diagnostics only). */
 	{
 		g_autoptr(GError) scaler_err = NULL;
 		g_autofree gchar *scaler_ver = NULL;
 		if (fu_dell_monitor_rt_device_read_scaler_version(self,
 								  &scaler_ver,
 								  &scaler_err)) {
-			g_debug("dell-monitor-rt: scaler version = %s", scaler_ver);
-			/* Show both versions in the user-visible string */
-			g_autofree gchar *combined =
-			    g_strdup_printf("%s+%s", version, scaler_ver);
-			fu_device_set_version(device, combined);
+			fu_device_set_version(device, scaler_ver);
 			return TRUE;
 		}
 		g_warning("dell-monitor-rt: scaler version read failed: %s",
 			  scaler_err->message);
 	}
 
+	/* Fallback to the hub MCU version if the scaler read failed —
+	 * better than nothing for diagnostic purposes. */
 	fu_device_set_version(device, version);
 	return TRUE;
 }
