@@ -54,14 +54,23 @@
 #define DELL_MONITOR_RT_AUTH_SUB_REQUEST   0x01
 #define DELL_MONITOR_RT_AUTH_SUB_RESPONSE  0x03
 
-/* Per-product 8-byte cal_auth key for the U4025QW. Recovered empirically
- * from the captured handshake cycles in the .pcap (frames 7704/7996/
- * 8122/8148 — see PLUGIN_NOTES "I²C tunnel auth handshake"). The on-device
- * computation derives this from a buffer set by the GUI before open();
- * we don't yet know how to compute it from first principles, so we
- * hard-code it for now. */
-static const guint8 DELL_MONITOR_RT_U4025QW_HUB_KEY[8] = {
-    0x4F, 0xDC, 0xC1, 0x10, 0x11, 0x6D, 0x76, 0x02,
+/* Per-product synkey-seed buffer for the U4025QW, verbatim from the
+ * `cert.dat` file shipped in Dell's monitorfirmwareupdateutility .deb.
+ * (Dell's own naming — "cert.dat" — is misleading; it's not an X.509
+ * cert but the seed buffer that derives the cal_auth key. See
+ * PLUGIN_NOTES "I²C tunnel auth handshake".)
+ *
+ * fu_dell_monitor_rt_get_synkey() walks this buffer with the algorithm
+ * decoded from RTS5409S_HID::get_synkey() in libdevices.so to derive
+ * the 8-byte cal_auth key. For the U4025QW the derived key is
+ *   4F DC C1 10 11 6D 76 02
+ * which we previously hard-coded; deriving it from the seed lets us
+ * support other Dell monitors by swapping out this blob (eventually
+ * sourced from the .upg firmware payload, once the parser exists). */
+static const guint8 DELL_MONITOR_RT_U4025QW_SYNKEY_SEED[18] = {
+    0xF8, 0xB7, 0xFD, 0x21, 0xE0, 0x32, 0x22, 0xB8,
+    0xA9, 0xE8, 0x7C, 0x11, 0x04, 0x94, 0xE2, 0x9D,
+    0x9F, 0x6A,
 };
 
 /* I²C target addresses on the monitor's internal bus (per DDC/CI standard
@@ -244,6 +253,69 @@ fu_dell_monitor_rt_device_read_version(FuDellMonitorRtDevice *self,
 		*version_out = g_strdup_printf("hub-%X.%02X", major, minor);
 	}
 	return TRUE;
+}
+
+/*
+ * Walk a per-product seed buffer and derive the 8-byte cal_auth key.
+ * Decoded from RTS5409S_HID::get_synkey() in libdevices.so (0xb8570).
+ *
+ * The seed is shipped as `cert.dat` in Dell's .deb (a misnomer — it's
+ * not a certificate, just a key-derivation seed). At runtime Dell's
+ * binary loads `cert.dat` and feeds it through the libdevices plugin
+ * interface (`load(data, len)` → `IIC_INTF::load` → `HID_INTF::load`)
+ * which copies it into RTS5409S_HID's vector at this+0x18; then
+ * RTS5409S_HID::open() runs get_synkey() which derives the 8 key
+ * bytes into this+0x21A.
+ *
+ * For each "trigger" byte buf[in]:
+ *   - if (buf[in] & 0x11) == 0x01 or 0x10:  FAST — consume 2 bytes,
+ *       produce 1 key byte = buf[in] ^ buf[in+1]
+ *   - if (buf[in] & 0x11) == 0x11:          SLOW — consume 3 bytes,
+ *       produce 2 key bytes:
+ *         key[out]   = buf[in]   ^ buf[in+1]
+ *         key[out+1] = buf[in+2] ^ buf[in+1]
+ *   - if (buf[in] & 0x11) == 0x00:          SKIP — consume 1, no key
+ *
+ * Output bytes that overflow the 8-byte key buffer are discarded
+ * (Dell's binary writes them past the 8-byte field; we just clip).
+ */
+static void
+fu_dell_monitor_rt_get_synkey(const guint8 *seed,
+			      gsize seed_len,
+			      guint8 key[8])
+{
+	gsize in_idx = 0;
+	gsize out_idx = 0;
+
+	memset(key, 0, 8);
+	while (in_idx < seed_len && out_idx < 8) {
+		guint8 trigger = seed[in_idx];
+		guint8 bits = trigger & 0x11;
+
+		if (bits == 0x01 || bits == 0x10) {
+			/* FAST */
+			if (in_idx + 1 >= seed_len)
+				break;
+			key[out_idx] = trigger ^ seed[in_idx + 1];
+			in_idx  += 2;
+			out_idx += 1;
+		} else if (bits == 0x11) {
+			/* SLOW — write what fits, advance by 3 (note: the +1
+			 * at LAB_001b85cb in the C decompile is INSIDE the
+			 * else branch, so it doesn't apply to the slow path). */
+			if (in_idx + 2 >= seed_len)
+				break;
+			if (out_idx < 8)
+				key[out_idx] = trigger ^ seed[in_idx + 1];
+			if (out_idx + 1 < 8)
+				key[out_idx + 1] = seed[in_idx + 2] ^ seed[in_idx + 1];
+			in_idx  += 3;
+			out_idx += 2;
+		} else {
+			/* SKIP */
+			in_idx += 1;
+		}
+	}
 }
 
 /*
@@ -485,13 +557,19 @@ fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 	    0x51, 0x84, 0xc0, 0x99, 0xee, 0x20, 0x2c,
 	};
 	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	guint8 hub_key[8];
+
+	/* Derive the cal_auth key from the per-product seed buffer
+	 * (cert.dat shipped with Dell's .deb). For the U4025QW this
+	 * yields 4F DC C1 10 11 6D 76 02. */
+	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+				      hub_key);
 
 	/* The I²C tunnel is gated by a per-cycle auth handshake; the device
 	 * STALLs subsequent 0xC6/0xD6 traffic if we skip it. Per the pcap
 	 * the handshake must precede the WRITE in each cycle. */
-	if (!fu_dell_monitor_rt_device_handshake(self,
-						 DELL_MONITOR_RT_U4025QW_HUB_KEY,
-						 error))
+	if (!fu_dell_monitor_rt_device_handshake(self, hub_key, error))
 		return FALSE;
 
 	if (!fu_dell_monitor_rt_device_i2c_write(self,
