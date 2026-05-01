@@ -42,3 +42,13 @@ fwupdtool.txt
 *.nix
 /.direnv
 /.envrc
+
+# Fork-only: nix build symlinks
+/result
+/result-*
+
+# Fork-only: meson subproject downloads (regenerated on configure)
+/subprojects/.wraplock
+/subprojects/cmocka-*/
+/subprojects/cmocka.wrap
+/subprojects/packagecache/
