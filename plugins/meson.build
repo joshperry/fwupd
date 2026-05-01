@@ -39,6 +39,7 @@ plugins = {
   'dell': false,
   'dell-dock': false,
   'dell-kestrel': false,
+  'dell-monitor-rt': false,
   'devlink': false,
   'dfu': false,
   'ebitdo': false,

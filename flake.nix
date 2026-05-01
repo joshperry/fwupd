@@ -30,8 +30,11 @@
             -Dplugin_uefi_capsule_splash=false \
             -Dvendor_ids_dir=${pkgs.hwdata}/share/hwdata \
             -Dumockdev_tests=disabled \
+            --localstatedir="$PWD/build/_local" \
+            --sysconfdir="$PWD/build/_etc" \
             --buildtype=debug \
             "$@"
+          mkdir -p "$PWD/build/_local" "$PWD/build/_etc"
           echo
           echo "Built. To compile:"
           echo "  meson compile -C build"
