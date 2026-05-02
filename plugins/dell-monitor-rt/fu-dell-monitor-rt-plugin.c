@@ -8,6 +8,7 @@
 #include "config.h"
 
 #include "fu-dell-monitor-rt-device.h"
+#include "fu-dell-monitor-rt-firmware.h"
 #include "fu-dell-monitor-rt-plugin.h"
 
 struct _FuDellMonitorRtPlugin {
@@ -27,6 +28,7 @@ fu_dell_monitor_rt_plugin_constructed(GObject *obj)
 	FuPlugin *plugin = FU_PLUGIN(obj);
 	fu_plugin_add_udev_subsystem(plugin, "hidraw");
 	fu_plugin_add_device_gtype(plugin, FU_TYPE_DELL_MONITOR_RT_DEVICE);
+	fu_plugin_add_firmware_gtype(plugin, FU_TYPE_DELL_MONITOR_RT_FIRMWARE);
 
 	/* chain up to parent */
 	G_OBJECT_CLASS(fu_dell_monitor_rt_plugin_parent_class)->constructed(obj);
