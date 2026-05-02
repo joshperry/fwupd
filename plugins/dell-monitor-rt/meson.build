@@ -6,6 +6,7 @@ plugins += {meson.current_source_dir().split('/')[-1]: true}
 plugin_quirks += files('dell-monitor-rt.quirk')
 plugin_builtins += static_library('fu_plugin_dell_monitor_rt',
   sources: [
+    'fu-dell-monitor-rt-crypto.c',
     'fu-dell-monitor-rt-device.c',
     'fu-dell-monitor-rt-firmware.c',
     'fu-dell-monitor-rt-firmware-component.c',

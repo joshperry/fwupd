@@ -75,3 +75,24 @@ fu_dell_monitor_rt_firmware_component_set_field(FuDellMonitorRtFirmwareComponent
 GBytes *
 fu_dell_monitor_rt_firmware_component_get_field(FuDellMonitorRtFirmwareComponent *self,
 						FuDellMonitorRtFirmwareField idx);
+
+/* Set/get the plaintext form of a metadata field. The container parser
+ * populates these when it has the per-product passphrase available; if a
+ * field couldn't be decrypted (or hasn't been yet) the getter returns
+ * NULL and callers should fall back to `_get_field`. */
+void
+fu_dell_monitor_rt_firmware_component_set_field_string(FuDellMonitorRtFirmwareComponent *self,
+						       FuDellMonitorRtFirmwareField idx,
+						       const gchar *value);
+const gchar *
+fu_dell_monitor_rt_firmware_component_get_field_string(FuDellMonitorRtFirmwareComponent *self,
+						       FuDellMonitorRtFirmwareField idx);
+
+/* Decrypted form of the component key. NULL for plaintext keys (use
+ * `fu_firmware_get_id` instead) and for panel-bound keys whose decryption
+ * failed. Otherwise carries the panel_id string (e.g. "753.0AK01.0007"). */
+void
+fu_dell_monitor_rt_firmware_component_set_panel_id(FuDellMonitorRtFirmwareComponent *self,
+						   const gchar *panel_id);
+const gchar *
+fu_dell_monitor_rt_firmware_component_get_panel_id(FuDellMonitorRtFirmwareComponent *self);

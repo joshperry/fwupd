@@ -6,6 +6,7 @@
 
 #include "config.h"
 
+#include "fu-dell-monitor-rt-crypto.h"
 #include "fu-dell-monitor-rt-firmware-component.h"
 #include "fu-dell-monitor-rt-firmware.h"
 
@@ -431,6 +432,75 @@ fu_dell_monitor_rt_firmware_parse(FuFirmware *firmware,
 			return FALSE;
 		}
 		fu_firmware_set_bytes(FU_FIRMWARE(component), payload);
+	}
+
+	/* Second pass: decrypt every metadata field with the per-product
+	 * passphrase Wistron@<product>. If a field decrypts cleanly we
+	 * stash the plaintext on the component for downstream consumers
+	 * (chip-GUID dispatch, version display, etc.). Failures are
+	 * non-fatal: the encrypted bytes are still available via the
+	 * raw `_get_field` accessor. */
+	{
+		g_autofree gchar *passphrase = g_strdup_printf("Wistron@%s", self->product);
+		GPtrArray *images = fu_firmware_get_images(firmware);
+		for (guint i = 0; i < images->len; i++) {
+			FuDellMonitorRtFirmwareComponent *component =
+			    FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT(g_ptr_array_index(images, i));
+
+			/* Panel-bound key carries an encrypted panel_id. */
+			if (fu_dell_monitor_rt_firmware_component_get_panel_bound(component)) {
+				GBytes *key =
+				    fu_dell_monitor_rt_firmware_component_get_key(component);
+				g_autoptr(GError) error_local = NULL;
+				g_autofree gchar *panel_id =
+				    fu_dell_monitor_rt_decrypt_metadata_field_as_string(
+					passphrase,
+					key,
+					&error_local);
+				if (panel_id != NULL) {
+					fu_dell_monitor_rt_firmware_component_set_panel_id(
+					    component,
+					    panel_id);
+					/* Replace placeholder id with the real
+					 * panel_id so downstream filtering can
+					 * use it as a stable handle. */
+					fu_firmware_set_id(FU_FIRMWARE(component), panel_id);
+				} else {
+					g_debug("decrypt panel_id key for component %u: %s",
+						i,
+						error_local->message);
+				}
+			}
+
+			/* 17 metadata fields. */
+			for (guint j = 0;
+			     j < FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT_FIELDS;
+			     j++) {
+				GBytes *raw =
+				    fu_dell_monitor_rt_firmware_component_get_field(component, j);
+				g_autoptr(GError) error_local = NULL;
+				g_autofree gchar *plain = NULL;
+
+				if (raw == NULL || g_bytes_get_size(raw) == 0)
+					continue;
+				plain = fu_dell_monitor_rt_decrypt_metadata_field_as_string(
+				    passphrase,
+				    raw,
+				    &error_local);
+				if (plain != NULL) {
+					fu_dell_monitor_rt_firmware_component_set_field_string(
+					    component,
+					    j,
+					    plain);
+				} else {
+					g_debug(
+					    "decrypt field %u of component %u: %s",
+					    j,
+					    i,
+					    error_local->message);
+				}
+			}
+		}
 	}
 
 	/* The TBT trailer (if present) is intentionally not consumed. */
