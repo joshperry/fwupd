@@ -132,11 +132,20 @@ def _read_phases(intermediate_zip: str) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def _add_report_id_prefix(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Rewrite Write:Data and Ioctl:Request DataOut so each carries a
-    leading 0x00 Report-ID byte ahead of the captured wire payload.
+    """Rewrite Write events and Ioctl events so each carries a leading
+    0x00 Report-ID byte ahead of the captured wire payload.
     pcap2emulation.py emits the wire bytes verbatim because it can't tell
     from the pcap whether the device declares Report IDs; we know the
-    U4025QW doesn't, so the hidraw I/O is `0x00 + payload`."""
+    U4025QW doesn't, so the hidraw I/O is `0x00 + payload`.
+
+    For Ioctl events we also have to synthesize the input-buffer half of
+    fwupd's event-id format. fu_ioctl_execute() builds the lookup key as
+    `Ioctl:Request=0x..,Data=<base64-of-input>,Length=0x..` (see
+    fu-ioctl.c:258-263), where the input buffer is whatever the plugin
+    passed in. Our plugin zeroes the response buffer before HIDIOCGINPUT,
+    so the input is 193 zero bytes — that's what we encode here. The
+    captured response payload moves to the DataOut field that
+    fu_device_event_copy_data reads back into the plugin's buffer."""
     rewritten: List[Dict[str, Any]] = []
     for ev in events:
         eid = ev.get("Id", "")
@@ -152,15 +161,25 @@ def _add_report_id_prefix(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             new_ev = dict(ev)
             new_ev["Id"] = f"Write:Data={new_b64},Length=0x{len(padded):x}"
             rewritten.append(new_ev)
-        elif eid.startswith("Ioctl:Request=") and "DataOut" in ev:
+        elif eid.startswith("Ioctl:Request="):
+            # Captured response payload is in DataOut for events created
+            # by the converter's existing code path, or in Data for
+            # events that came through the new GET_REPORT pairing path.
+            response_b64 = ev.get("DataOut") or ev.get("Data") or ""
             try:
-                wire = base64.b64decode(ev["DataOut"]) if ev["DataOut"] else b""
+                wire = base64.b64decode(response_b64) if response_b64 else b""
             except Exception:
                 rewritten.append(ev)
                 continue
-            padded = bytes([HIDRAW_REPORT_ID_PREFIX]) + wire
-            new_ev = dict(ev)
-            new_ev["DataOut"] = base64.b64encode(padded).decode("ascii")
+            padded_response = bytes([HIDRAW_REPORT_ID_PREFIX]) + wire
+            # Plugin's input buffer is zeroed (memset before HIDIOCGINPUT).
+            zeroed_input = bytes(len(padded_response))
+            zeroed_b64 = base64.b64encode(zeroed_input).decode("ascii")
+            request_part = eid.split(",", 1)[0]  # "Ioctl:Request=0x..."
+            new_ev = {
+                "Id": f"{request_part},Data={zeroed_b64},Length=0x{len(padded_response):x}",
+                "DataOut": base64.b64encode(padded_response).decode("ascii"),
+            }
             rewritten.append(new_ev)
         else:
             rewritten.append(ev)
