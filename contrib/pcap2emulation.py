@@ -688,6 +688,253 @@ class Pcap2Emulation:
             self._save_phase()
 
 
+# --- FuHidrawDevice translation -----------------------------------------
+#
+# pcap2emulation.py records each USB device as a FuUsbDevice with USB-level
+# `ControlTransfer:` events. Plugins that talk to their hardware via the
+# kernel's hidraw interface (FuHidrawDevice / FuUdevDevice) instead of
+# libusb don't see USB control transfers — they see Write:/Ioctl: hidraw
+# events, and fwupd's emulation framework only intercepts I/O for devices
+# whose GType matches the backend that produced them. So a FuUsbDevice
+# fixture loaded against a FuHidrawDevice plugin doesn't intercept; the
+# plugin's hidraw I/O falls through to the real device file.
+#
+# The translation below converts the FuUsbDevice phase data into
+# equivalent FuHidrawDevice entries, splitting one USB device into N
+# hidraw entries (one per HID interface) and rewriting class control
+# transfers to their hidraw-API equivalents:
+#
+#   SET_REPORT (host -> device, class, interface, bRequest=0x09)
+#     -> Write:Data=<base64>,Length=0x..
+#   GET_REPORT (device -> host, class, interface, bRequest=0x01)
+#     -> Ioctl:Request=0xc0c1480a (HIDIOCGINPUT(193)),
+#        DataOut=<base64>
+#
+# Standard requests (descriptors, SET_CONFIGURATION, …) and non-HID
+# interface traffic are dropped, matching what a hidraw consumer would
+# never see.
+#
+# Note: pcap2emulation flips the direction bit when recording, so events
+# saved as Direction=0x01 are actually host->device on the wire.
+
+# HIDIOCGINPUT(192) — kernel _IOC encoding for the HID class GET_REPORT
+# the dell-monitor-rt plugin uses. dir=READ|WRITE, type='H', nr=0x0A, size=192.
+# The leading report-ID byte makes the buffer 193, but the ioctl size field
+# encodes the wire size (192 = 0xc0).
+HIDRAW_HIDIOCGINPUT_193 = 0xC0C1480A
+
+
+def _hidraw_event_from_control(usb_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Translate one ControlTransfer event into a hidraw Write/Ioctl event,
+    or return None if the event is dropped (non-HID-class, descriptor read,
+    etc.)."""
+    eid = usb_event.get("Id", "")
+    if not eid.startswith("ControlTransfer:"):
+        return None
+
+    # Parse the "k=v,k=v,..." tail. ControlTransfer: prefix already consumed.
+    body = eid[len("ControlTransfer:") :]
+    fields: Dict[str, str] = {}
+    for part in body.split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        fields[k] = v
+
+    # Only HID class control transfers go to the hidraw layer. Class+Interface
+    # recipient = bmRequestType bits (Type=Class=1, Recipient=Interface=1).
+    if fields.get("RequestType") != "0x01":
+        return None
+    if fields.get("Recipient") != "0x01":
+        return None
+
+    # Direction is flipped by pcap2emulation when recording — see the
+    # `direction = not (...)` line in the parser. So Direction=0x01 here
+    # means host->device on the wire (SET_REPORT-style write), and
+    # Direction=0x00 means device->host (GET_REPORT-style read).
+    direction = fields.get("Direction")
+    request = fields.get("Request")
+    data_b64 = fields.get("Data", "")
+    length_str = fields.get("Length", "0x0")
+    try:
+        length = int(length_str, 16) if length_str.startswith("0x") else int(length_str)
+    except ValueError:
+        length = 0
+
+    if direction == "0x01" and request == "0x09":
+        # SET_REPORT — host->device write. The captured Data is the wire
+        # payload (typically 64 / 192 / 256 bytes depending on the device's
+        # output report size). On the hidraw side the same payload is
+        # written verbatim by fu_udev_device_write — but the device may or
+        # may not have a leading Report ID byte depending on its HID
+        # descriptor. Devices that declare *no* report IDs are written
+        # as `0x00 + payload`; devices that declare report IDs use the
+        # report ID itself. This converter doesn't parse the HID
+        # descriptor, so it emits the wire payload as-is and leaves any
+        # Report-ID prefix to a downstream specialization layer.
+        return {
+            "Id": f"Write:Data={data_b64},Length=0x{length:x}",
+        }
+    if direction == "0x00" and request == "0x01":
+        # GET_REPORT — device->host read. Same Report-ID caveat applies.
+        # The ioctl request encodes len in its size field and our
+        # constant assumes len=192; plugins with different report sizes
+        # need their own constant.
+        return {
+            "Id": f"Ioctl:Request=0x{HIDRAW_HIDIOCGINPUT_193:x}",
+            "DataOut": usb_event.get("Data", data_b64),
+        }
+    return None
+
+
+def _backend_id_for_hid_interface(
+    usb_dev: Dict[str, Any], iface: Dict[str, Any], counter: int
+) -> str:
+    """Synthesize a plausible Linux sysfs hidraw BackendId.
+
+    The exact PCI host-controller path is machine-specific and won't match
+    the user's live device, but that's fine — fwupd's emulation framework
+    treats fixture entries with no matching real-device backend_id as
+    fresh synthetic devices and tags them FWUPD_DEVICE_FLAG_EMULATED.
+    The plugin still attaches via quirk (HIDRAW\\VEN_xxxx&DEV_xxxx) and
+    I/O gets intercepted because the synthetic device has the flag.
+    """
+    bus = usb_dev.get("PlatformId", "0-0").split("-")[0]
+    port = usb_dev.get("PlatformId", "0-0").split("-", 1)[1]
+    vid = usb_dev.get("IdVendor", 0)
+    pid = usb_dev.get("IdProduct", 0)
+    intf = iface.get("Interface", 0)
+    # 0003 in the HID device tag = HID class. Counter forms the instance
+    # suffix (e.g. .0034) and the hidraw node number.
+    return (
+        f"/sys/devices/pci0000:00/0000:00:14.0/usb{bus}/{bus}-{port}/"
+        f"{bus}-{port}:1.{intf}/0003:{vid:04X}:{pid:04X}.{counter:04X}/"
+        f"hidraw/hidraw{counter}"
+    )
+
+
+def _structural_events_for_hidraw(
+    backend_id: str, vid: int, pid: int
+) -> List[Dict[str, Any]]:
+    """Stereotyped events that an EMULATED FuHidrawDevice's setup-time probe
+    expects to find. Without these, fu_device_get_backend_parent() and the
+    HID property reads fall back to live sysfs queries — which fail because
+    the synthetic device has no real sysfs entry behind it. With them, the
+    EMULATED branch satisfies the queries from the recorded event store.
+
+    The first event records the device's USB parent in the device tree —
+    it's the parent of the hidraw node, with the trailing "/hidraw/hidrawN"
+    stripped. The remaining events synthesize the standard HID uevent
+    properties (HID_ID, HID_NAME) using the VID/PID we already have."""
+    parent_backend_id = backend_id.rsplit("/hidraw/", 1)[0]
+    return [
+        {
+            "Id": "GetBackendParent:Subsystem=hid",
+            "GType": "FuUdevDevice",
+            "BackendId": parent_backend_id,
+        },
+        {
+            "Id": "ReadProp:Key=HID_ID",
+            "Data": f"0003:{vid:08X}:{pid:08X}",
+        },
+        {
+            "Id": "ReadProp:Key=HID_NAME",
+            "Data": f"USB HID ({vid:04x}:{pid:04x})",
+        },
+    ]
+
+
+def convert_phases_to_hidraw(phases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Translate FuUsbDevice phases to FuHidrawDevice phases. One USB device
+    in the input becomes one FuHidrawDevice per HID interface in the output.
+
+    Each output device entry leads with the stereotyped probe events fwupd
+    needs to satisfy a hidraw setup walk under emulation, then includes the
+    translated wire events distributed to the matching interface based on
+    the wIndex of the original control transfer.
+
+    Per-device device IDs are kept stable across phases (same BackendId for
+    a given USB-interface tuple) so the engine can match an entry across
+    setup/install/reload — without that, the install phase's events don't
+    attach to the device that completed the setup phase."""
+    # Cache per-(usb_platform_id, interface_num) → (counter, BackendId) so
+    # the same logical interface in multiple phases gets the same BackendId.
+    # The counter seed is arbitrary; we just need uniqueness across entries.
+    counter_state = [0x30]
+    seen: Dict[Tuple[str, int], Tuple[int, str]] = {}
+
+    def _stable_entry_for(
+        usb_dev: Dict[str, Any], iface: Dict[str, Any]
+    ) -> Tuple[int, str]:
+        key = (usb_dev.get("PlatformId", ""), iface.get("Interface", 0))
+        if key not in seen:
+            counter_state[0] += 1
+            seen[key] = (
+                counter_state[0],
+                _backend_id_for_hid_interface(usb_dev, iface, counter_state[0]),
+            )
+        return seen[key]
+
+    new_phases: List[Dict[str, Any]] = []
+    for phase in phases:
+        new_devices: List[Dict[str, Any]] = []
+        for usb_dev in phase.get("UsbDevices", []):
+            hid_ifaces = [
+                iface
+                for iface in usb_dev.get("UsbInterfaces", [])
+                if iface.get("InterfaceClass") == INTERFACE_CLASS_HID
+            ]
+            if not hid_ifaces:
+                continue
+            # One FuHidrawDevice entry per HID interface
+            iface_entries: List[Dict[str, Any]] = []
+            for iface in hid_ifaces:
+                hidraw_n, backend_id = _stable_entry_for(usb_dev, iface)
+                vid = usb_dev.get("IdVendor", 0)
+                pid = usb_dev.get("IdProduct", 0)
+                entry = {
+                    "GType": "FuHidrawDevice",
+                    "BackendId": backend_id,
+                    "Subsystem": "hidraw",
+                    "DeviceFile": f"/dev/hidraw{hidraw_n}",
+                    "Created": 0,
+                    "IdVendor": vid,
+                    "IdProduct": pid,
+                    "Events": _structural_events_for_hidraw(backend_id, vid, pid),
+                    "_iface_num": iface.get("Interface", 0),
+                }
+                iface_entries.append(entry)
+            # Translate each USB event and route it to the matching interface
+            for usb_event in usb_dev.get("UsbEvents", []):
+                hidraw_event = _hidraw_event_from_control(usb_event)
+                if hidraw_event is None:
+                    continue
+                # Decode wIndex from the original event Id — class control
+                # transfers carry the target interface number there.
+                eid = usb_event.get("Id", "")
+                target_iface = 0
+                for part in eid.split(","):
+                    if part.startswith("Idx="):
+                        try:
+                            target_iface = int(part.split("=", 1)[1], 16) & 0xFF
+                        except ValueError:
+                            pass
+                        break
+                # Find the entry for this interface; fall back to first
+                for entry in iface_entries:
+                    if entry["_iface_num"] == target_iface:
+                        entry["Events"].append(hidraw_event)
+                        break
+                else:
+                    iface_entries[0]["Events"].append(hidraw_event)
+            # Strip the temporary _iface_num scaffolding before emit
+            for entry in iface_entries:
+                entry.pop("_iface_num", None)
+                new_devices.append(entry)
+        new_phases.append({"FwupdVersion": "2.0.0", "UsbDevices": new_devices})
+    return new_phases
+
+
 if __name__ == "__main__":
     options = argparse.ArgumentParser(description="Convert pcap file to emulation file")
     options.add_argument("input_pcap", type=str, help="pcap file to convert")
@@ -699,10 +946,23 @@ if __name__ == "__main__":
         nargs="+",
         help="Device ID in hexadecimal",
     )
+    options.add_argument(
+        "--gtype",
+        choices=["FuUsbDevice", "FuHidrawDevice"],
+        default="FuUsbDevice",
+        help=(
+            "Output device GType. FuUsbDevice (default) records USB-level "
+            "ControlTransfer events; FuHidrawDevice translates HID-class "
+            "control transfers into hidraw Write/Ioctl events suitable for "
+            "plugins that talk to their device via /dev/hidrawN."
+        ),
+    )
 
     args = options.parse_args()
 
     path = os.path.abspath(os.path.expanduser(os.path.expandvars(args.input_pcap)))
     parser = Pcap2Emulation(args.device_id)
     parser.parse_file(path)
+    if args.gtype == "FuHidrawDevice":
+        parser.phases = convert_phases_to_hidraw(parser.phases)
     parser.save_archive(args.output_archive)
