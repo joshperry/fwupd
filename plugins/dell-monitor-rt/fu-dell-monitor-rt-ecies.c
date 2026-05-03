@@ -8,8 +8,10 @@
 
 #include <gio/gio.h>
 #include <gmp.h>
+#include <nettle/dsa.h>
 #include <nettle/ecc-curve.h>
 #include <nettle/ecc.h>
+#include <nettle/ecdsa.h>
 #include <nettle/sha3.h>
 
 #include "fu-dell-monitor-rt-ecies.h"
@@ -19,6 +21,24 @@
 #define FU_DELL_MONITOR_RT_POINT_BYTES	   (1 + 2 * FU_DELL_MONITOR_RT_FIELD_BYTES) /* SEC1 0x04||X||Y */
 #define FU_DELL_MONITOR_RT_SHA3_512_DIGEST 64
 #define FU_DELL_MONITOR_RT_SHA3_512_BLOCK  72
+
+/* Each per-component plaintext we get out of ECIES ends in a 222-byte
+ * authenticator: the raw r||s ECDSA signature followed by a DER
+ * SubjectPublicKeyInfo carrying the (compressed) signing pubkey. */
+#define FU_DELL_MONITOR_RT_TRAILER_LEN	  222
+#define FU_DELL_MONITOR_RT_SIG_LEN	  (2 * FU_DELL_MONITOR_RT_FIELD_BYTES) /* r || s */
+#define FU_DELL_MONITOR_RT_SPKI_LEN	  90  /* DER SubjectPublicKeyInfo */
+#define FU_DELL_MONITOR_RT_COMPRESSED_LEN (1 + FU_DELL_MONITOR_RT_FIELD_BYTES) /* 02|03 || X */
+
+/* secp521r1 b coefficient (from FIPS 186-4 / SEC2). The a coefficient
+ * is just -3 mod p so we don't bother storing it. */
+static const guint8 fu_dell_monitor_rt_secp521r1_b[FU_DELL_MONITOR_RT_FIELD_BYTES] = {
+    0x00, 0x51, 0x95, 0x3e, 0xb9, 0x61, 0x8e, 0x1c, 0x9a, 0x1f, 0x92, 0x9a, 0x21, 0xa0,
+    0xb6, 0x85, 0x40, 0xee, 0xa2, 0xda, 0x72, 0x5b, 0x99, 0xb3, 0x15, 0xf3, 0xb8, 0xb4,
+    0x89, 0x91, 0x8e, 0xf1, 0x09, 0xe1, 0x56, 0x19, 0x39, 0x51, 0xec, 0x7e, 0x93, 0x7b,
+    0x16, 0x52, 0xc0, 0xbd, 0x3b, 0xb1, 0xbf, 0x07, 0x35, 0x73, 0xdf, 0x88, 0x3d, 0x2c,
+    0x34, 0xf1, 0xef, 0x45, 0x1f, 0xd4, 0x6b, 0x50, 0x3f, 0x00,
+};
 
 /* HMAC-SHA3-512 key length used by CryptoPP's HMAC<SHA3_512>::DEFAULT_KEYLENGTH.
  * The base class returns 16 (NOT the BLOCKSIZE of 72 nor the DIGESTSIZE of 64),
@@ -298,6 +318,263 @@ fu_dell_monitor_rt_gunzip(const guint8 *src, gsize src_len, GError **error)
 	return g_byte_array_free_to_bytes(g_steal_pointer(&out));
 }
 
+/*
+ * Decompress a SEC1-encoded compressed point (1 prefix byte + X) into
+ * its (X, Y) coordinates on secp521r1.
+ *
+ * For p ≡ 3 (mod 4), which holds for the secp521r1 field modulus
+ * p = 2^521 - 1, the modular square root is just (Y²)^((p+1)/4) mod p,
+ * i.e. Y²^(2^519) mod p. We pick the Y whose parity matches the prefix
+ * byte (0x02 → even Y, 0x03 → odd Y) and return p - Y otherwise.
+ */
+static gboolean
+fu_dell_monitor_rt_secp521r1_decompress(const guint8 *compressed,
+					mpz_t x_out,
+					mpz_t y_out,
+					GError **error)
+{
+	mpz_t p, b, y_squared, three_x, exponent;
+	guint parity_wanted;
+	gboolean ret = FALSE;
+
+	if (compressed[0] != 0x02 && compressed[0] != 0x03) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "compressed point prefix 0x%02x not 0x02/0x03",
+			    compressed[0]);
+		return FALSE;
+	}
+	parity_wanted = compressed[0] - 0x02; /* 0 = even Y, 1 = odd Y */
+
+	mpz_inits(p, b, y_squared, three_x, exponent, NULL);
+
+	/* p = 2^521 - 1 */
+	mpz_set_ui(p, 1);
+	mpz_mul_2exp(p, p, 521);
+	mpz_sub_ui(p, p, 1);
+
+	mpz_import(x_out, FU_DELL_MONITOR_RT_FIELD_BYTES, 1, 1, 0, 0, compressed + 1);
+	if (mpz_cmp(x_out, p) >= 0) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "compressed point X >= p");
+		goto out;
+	}
+	mpz_import(b,
+		   FU_DELL_MONITOR_RT_FIELD_BYTES,
+		   1,
+		   1,
+		   0,
+		   0,
+		   fu_dell_monitor_rt_secp521r1_b);
+
+	/* Y² = X³ - 3X + b (mod p) */
+	mpz_powm_ui(y_squared, x_out, 3, p);
+	mpz_mul_ui(three_x, x_out, 3);
+	mpz_sub(y_squared, y_squared, three_x);
+	mpz_add(y_squared, y_squared, b);
+	mpz_mod(y_squared, y_squared, p);
+
+	/* Y = Y² ^ ((p+1)/4) mod p   ;   (p+1)/4 = 2^519 for this curve. */
+	mpz_set_ui(exponent, 1);
+	mpz_mul_2exp(exponent, exponent, 519);
+	mpz_powm(y_out, y_squared, exponent, p);
+
+	/* Validate the recovered Y is actually a square root (catches the
+	 * "X has no Y on curve" case where the powm result is bogus). */
+	{
+		mpz_t check;
+		mpz_init(check);
+		mpz_powm_ui(check, y_out, 2, p);
+		if (mpz_cmp(check, y_squared) != 0) {
+			mpz_clear(check);
+			g_set_error_literal(error,
+					    FWUPD_ERROR,
+					    FWUPD_ERROR_INVALID_DATA,
+					    "compressed point X is not on the curve");
+			goto out;
+		}
+		mpz_clear(check);
+	}
+
+	if (mpz_tstbit(y_out, 0) != parity_wanted)
+		mpz_sub(y_out, p, y_out);
+	ret = TRUE;
+
+out:
+	mpz_clears(p, b, y_squared, three_x, exponent, NULL);
+	return ret;
+}
+
+/*
+ * Parse the 90-byte DER-encoded SubjectPublicKeyInfo carrying the
+ * trailer's signing pubkey. We don't reach for a full DER parser
+ * because the structure is byte-for-byte fixed (verified against
+ * captures/signing-pubkey.spki.der):
+ *
+ *   30 58                                    SEQUENCE (88)
+ *     30 10                                  SEQUENCE (16) — AlgorithmIdentifier
+ *       06 07 2a 86 48 ce 3d 02 01           OID 1.2.840.10045.2.1 (ecPublicKey)
+ *       06 05 2b 81 04 00 23                 OID 1.3.132.0.35 (secp521r1)
+ *     03 44                                  BIT STRING (68)
+ *       00                                   0 unused bits
+ *       02 || X                              compressed secp521r1 point
+ *
+ * If a future Dell/Wistron release switches to uncompressed encoding
+ * (`04 || X || Y` inside the BIT STRING) we'd need to extend this.
+ */
+static const guint8 fu_dell_monitor_rt_spki_prefix[24] = {
+    0x30, 0x58, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+    0x01, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23, 0x03, 0x44, 0x00,
+    /* compressed point follows: 0x02 or 0x03 then 66 X bytes */
+};
+G_STATIC_ASSERT(sizeof(fu_dell_monitor_rt_spki_prefix) - 1 +
+		    FU_DELL_MONITOR_RT_COMPRESSED_LEN ==
+		FU_DELL_MONITOR_RT_SPKI_LEN);
+
+static gboolean
+fu_dell_monitor_rt_parse_spki(const guint8 *spki,
+			      mpz_t x_out,
+			      mpz_t y_out,
+			      GError **error)
+{
+	if (memcmp(spki,
+		   fu_dell_monitor_rt_spki_prefix,
+		   sizeof(fu_dell_monitor_rt_spki_prefix) - 1) != 0) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "trailer SPKI prefix doesn't match the expected "
+				    "fixed encoding");
+		return FALSE;
+	}
+	return fu_dell_monitor_rt_secp521r1_decompress(
+	    spki + (sizeof(fu_dell_monitor_rt_spki_prefix) - 1),
+	    x_out,
+	    y_out,
+	    error);
+}
+
+/* Hex-encode `in` into `out` as `2*in_len` uppercase ASCII chars,
+ * no separator. Caller owns out. */
+static void
+fu_dell_monitor_rt_hex_encode_upper(const guint8 *in, gsize in_len, gchar *out)
+{
+	static const gchar hexchars[] = "0123456789ABCDEF";
+	for (gsize i = 0; i < in_len; i++) {
+		out[i * 2 + 0] = hexchars[in[i] >> 4];
+		out[i * 2 + 1] = hexchars[in[i] & 0x0f];
+	}
+}
+
+/*
+ * Verify the per-bundle ECDSA-secp521r1-with-SHA3_512 signature in the
+ * trailer against the firmware bytes preceding it. Uses the trailer's
+ * own embedded signing pubkey — see task #25 about elevating this to a
+ * real chain of trust by also verifying that pubkey is signed by a root
+ * key baked into libhub.so.
+ *
+ * Dell wraps the firmware in a layered hash before signing (verified
+ * empirically against captures/load-vec-*.bin):
+ *
+ *   outer_message = uppercase_hex(SHA3-512(uppercase_hex(firmware_bytes)))
+ *
+ * The ECDSA<ECP, SHA3_512>::Verifier then hashes outer_message once more
+ * with SHA3-512 internally before verifying, so the digest the signature
+ * ultimately covers is:
+ *
+ *   final_digest = SHA3-512(outer_message)
+ *
+ * The double hex-then-hash dance is what `Certify::c` does in libhub.so
+ * — it goes via Certify::h which is defined as:
+ *
+ *   Certify::h(input) = uppercase_hex(SHA3-512(input))
+ *
+ * applied to `uppercase_hex(firmware)`. We replicate it here verbatim.
+ */
+static gboolean
+fu_dell_monitor_rt_verify_trailer(const guint8 *firmware,
+				  gsize firmware_len,
+				  const guint8 *trailer,
+				  GError **error)
+{
+	const struct ecc_curve *curve = nettle_get_secp_521r1();
+	struct ecc_point pub;
+	struct dsa_signature sig;
+	struct sha3_512_ctx hash_ctx;
+	mpz_t x, y;
+	guint8 inner_digest[FU_DELL_MONITOR_RT_SHA3_512_DIGEST];
+	guint8 final_digest[FU_DELL_MONITOR_RT_SHA3_512_DIGEST];
+	gchar outer_hex[FU_DELL_MONITOR_RT_SHA3_512_DIGEST * 2]; /* 128 chars */
+	g_autofree gchar *firmware_hex = NULL;
+	gboolean ok = FALSE;
+
+	mpz_inits(x, y, NULL);
+	ecc_point_init(&pub, curve);
+	dsa_signature_init(&sig);
+
+	/* Recover the signing point from the trailer's SPKI. */
+	if (!fu_dell_monitor_rt_parse_spki(trailer + FU_DELL_MONITOR_RT_SIG_LEN,
+					   x,
+					   y,
+					   error))
+		goto out;
+	if (!ecc_point_set(&pub, x, y)) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "trailer signing pubkey is not a valid secp521r1 point");
+		goto out;
+	}
+
+	/* Import r and s from the raw IEEE-1363 sig: 66+66 bytes BE. */
+	mpz_import(sig.r, FU_DELL_MONITOR_RT_FIELD_BYTES, 1, 1, 0, 0, trailer);
+	mpz_import(sig.s,
+		   FU_DELL_MONITOR_RT_FIELD_BYTES,
+		   1,
+		   1,
+		   0,
+		   0,
+		   trailer + FU_DELL_MONITOR_RT_FIELD_BYTES);
+
+	/* uppercase_hex(firmware) */
+	firmware_hex = g_malloc(firmware_len * 2);
+	fu_dell_monitor_rt_hex_encode_upper(firmware, firmware_len, firmware_hex);
+
+	/* SHA3-512(uppercase_hex(firmware)) → 64 bytes */
+	sha3_512_init(&hash_ctx);
+	sha3_512_update(&hash_ctx, firmware_len * 2, (const guint8 *)firmware_hex);
+	sha3_512_digest(&hash_ctx, sizeof(inner_digest), inner_digest);
+
+	/* uppercase_hex of those 64 bytes → 128-char ASCII */
+	fu_dell_monitor_rt_hex_encode_upper(inner_digest,
+					    sizeof(inner_digest),
+					    outer_hex);
+
+	/* SHA3-512 of the outer 128-char message — the digest ECDSA actually
+	 * verifies against. */
+	sha3_512_init(&hash_ctx);
+	sha3_512_update(&hash_ctx, sizeof(outer_hex), (const guint8 *)outer_hex);
+	sha3_512_digest(&hash_ctx, sizeof(final_digest), final_digest);
+
+	if (!ecdsa_verify(&pub, sizeof(final_digest), final_digest, &sig)) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_AUTH_FAILED,
+				    "trailer ECDSA signature did not verify against firmware");
+		goto out;
+	}
+	ok = TRUE;
+
+out:
+	mpz_clears(x, y, NULL);
+	ecc_point_clear(&pub);
+	dsa_signature_clear(&sig);
+	return ok;
+}
+
 GBytes *
 fu_dell_monitor_rt_decrypt_payload(GBytes *ciphertext, GError **error)
 {
@@ -381,13 +658,41 @@ fu_dell_monitor_rt_decrypt_payload(GBytes *ciphertext, GError **error)
 		plaintext[i] =
 		    encrypted[i] ^ derived_key[FU_DELL_MONITOR_RT_HMAC_KEY_BYTES + i];
 
-	/* (6) Gunzip the XOR plaintext → ASCII hex stream → final firmware. */
+	/* (6) Gunzip the XOR plaintext → ASCII hex stream → firmware||trailer. */
 	gunzipped = fu_dell_monitor_rt_gunzip(plaintext, encrypted_len, error);
 	if (gunzipped == NULL)
 		return NULL;
 	{
 		gsize gz_len = 0;
 		const guint8 *gz_data = g_bytes_get_data(gunzipped, &gz_len);
-		return fu_dell_monitor_rt_hex_decode(gz_data, gz_len, error);
+		g_autoptr(GBytes) firmware_with_trailer =
+		    fu_dell_monitor_rt_hex_decode(gz_data, gz_len, error);
+		gsize fwt_len = 0;
+		const guint8 *fwt_data;
+		if (firmware_with_trailer == NULL)
+			return NULL;
+		fwt_data = g_bytes_get_data(firmware_with_trailer, &fwt_len);
+		if (fwt_len < FU_DELL_MONITOR_RT_TRAILER_LEN) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "decoded payload too short for trailer: %" G_GSIZE_FORMAT,
+				    fwt_len);
+			return NULL;
+		}
+
+		/* (7) Verify the trailer's ECDSA signature against the
+		 * firmware bytes, then strip the trailer so consumers
+		 * only see the firmware. */
+		{
+			gsize firmware_len = fwt_len - FU_DELL_MONITOR_RT_TRAILER_LEN;
+			const guint8 *trailer = fwt_data + firmware_len;
+			if (!fu_dell_monitor_rt_verify_trailer(fwt_data,
+							       firmware_len,
+							       trailer,
+							       error))
+				return NULL;
+			return g_bytes_new(fwt_data, firmware_len);
+		}
 	}
 }
