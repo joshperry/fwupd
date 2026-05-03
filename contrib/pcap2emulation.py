@@ -61,6 +61,12 @@ class Pcap2Emulation:
         self.endpoint_index = 0
         self.previous_data: Optional[str]
         self.bulk_incoming_lens: Dict[str, int] = {}
+        # In-flight device->host control transfer requests, keyed by the
+        # SUBMIT frame number so the matching COMPLETE response frame can
+        # find the partially-built event via usb.request_in. Used to pair
+        # HID GET_REPORT requests with their separate response frames —
+        # see the response branch in parse_file() for context.
+        self.pending_control: Dict[str, Dict[str, Any]] = {}
         self.usb_port = None
         self.enumerate = False
 
@@ -128,7 +134,14 @@ class Pcap2Emulation:
             phase += 1
 
     def _run_tshark(self, file: str, tshark_filter: str) -> Any:
-        cmd = ["tshark", "-n", "-T", "ek", "-l", "-2", "-r", file, "-R"]
+        # --hexdump frames adds a frame_raw field (full frame as hex) to
+        # the JSON output. Needed so we can recover the response payload
+        # of HID-class GET_REPORT control transfers, which the dissector
+        # doesn't expose under any named field — the bytes are there in
+        # the raw frame after the 64-byte usbmon header but no protocol
+        # parser claims them. Without this we'd silently drop reads.
+        cmd = ["tshark", "-n", "-T", "ek", "--hexdump", "frames",
+               "-l", "-2", "-r", file, "-R"]
         print("running: " + " ".join(cmd) + ' "' + tshark_filter + '"')
         cmd.append(tshark_filter)
         return subprocess.Popen(cmd, stdout=subprocess.PIPE)
@@ -658,9 +671,25 @@ class Pcap2Emulation:
                                 base64.b64encode(bytes.fromhex(data)), "utf-8"
                             )
                             self._save_event(event)
+                        else:
+                            # Device->host request (e.g. HID GET_REPORT).
+                            # The response data lands in a separate
+                            # COMPLETE frame later — stash the
+                            # in-progress event keyed by this SUBMIT
+                            # frame's number so the COMPLETE frame can
+                            # pair via usb.request_in. Without this,
+                            # device->host control transfers were
+                            # silently dropped because the in-progress
+                            # event went out of scope between frames.
+                            self.pending_control[
+                                layers["frame"]["frame_frame_number"]
+                            ] = event
 
                     elif "usb_usb_control_Response" in layers:
-                        # Found CONTROL URB response
+                        # Found CONTROL URB response (vendor-class style
+                        # where the response payload arrives as its own
+                        # named field). HID-class GET_REPORT responses
+                        # don't have this field — they're handled below.
                         data = layers["usb_usb_control_Response"].replace(":", "")
                         event["Data"] = str(
                             base64.b64encode(bytes.fromhex(data)), "utf-8"
@@ -668,6 +697,38 @@ class Pcap2Emulation:
 
                         # now that the event is complete it can be added to the device events
                         self._save_event(event)
+
+                    elif (
+                        "usb_usb_request_in" in layers["usb"]
+                        and layers["usb"]["usb_usb_urb_type"] == "'C'"
+                        and layers["usb"]["usb_usb_request_in"]
+                        in self.pending_control
+                    ):
+                        # COMPLETE frame for a previously-stashed
+                        # device->host control transfer (HID GET_REPORT
+                        # is the canonical case). Pair via usb.request_in,
+                        # extract the response payload from frame_raw —
+                        # it sits past the 64-byte usbmon header and runs
+                        # for usb.urb_len bytes — and finalize the event.
+                        request_in = layers["usb"]["usb_usb_request_in"]
+                        completed_event = self.pending_control.pop(request_in)
+                        urb_len = get_int(layers["usb"].get("usb_usb_urb_len", "0"))
+                        if "frame_raw" in layers and urb_len > 0:
+                            frame_hex = layers["frame_raw"]
+                            if isinstance(frame_hex, list) and frame_hex:
+                                frame_hex = frame_hex[0]
+                            try:
+                                frame_bytes = bytes.fromhex(frame_hex)
+                                # usbmon Linux pseudo-header is 64 bytes;
+                                # the URB payload starts immediately after
+                                # and runs for urb_len bytes.
+                                payload = frame_bytes[64 : 64 + urb_len]
+                                completed_event["Data"] = str(
+                                    base64.b64encode(payload), "utf-8"
+                                )
+                            except (ValueError, TypeError):
+                                pass
+                        self._save_event(completed_event)
 
                 elif get_int(layers["usb"]["usb_usb_transfer_type"]) == URB_BULK:
                     # TODO: check it
