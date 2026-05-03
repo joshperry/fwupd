@@ -47,6 +47,7 @@
 #define DELL_MONITOR_RT_OPCODE_ENABLE_HIGH_CLOCK     0x06
 #define DELL_MONITOR_RT_OPCODE_GET_FW_VERSION        0x09  /* hub MCU only */
 #define DELL_MONITOR_RT_OPCODE_AUTH                  0xE1  /* I²C tunnel auth */
+#define DELL_MONITOR_RT_OPCODE_BOOTLOADER_ENTER      0xE9  /* re-enumerate as bootloader */
 #define DELL_MONITOR_RT_OPCODE_I2C_WRITE             0xC6  /* I²C tunnel write */
 #define DELL_MONITOR_RT_OPCODE_I2C_READ              0xD6  /* I²C tunnel read req */
 
@@ -655,6 +656,35 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 	const guint8 vendor_sig[2] = {DELL_MONITOR_RT_VENDOR_SIG_LO,
 				      DELL_MONITOR_RT_VENDOR_SIG_HI};
 
+	/* SAFETY GUARD — see write_firmware for the full rationale. setup()
+	 * issues real writes too (enable_vdcmd, cal_auth response, i2c_write
+	 * for the DDC/CI version probe), so we must refuse the same way if
+	 * fwupd hasn't tagged the device emulated. The IO helpers
+	 * (fu_udev_device_write etc.) only intercept when EMULATED is set —
+	 * absent that flag they fall through to /dev/hidrawN. Skip the
+	 * vendor-command init entirely; report a placeholder version so
+	 * fwupd still has something to display in get-devices output.
+	 *
+	 * Also inhibit the device so install dispatch ignores it. When an
+	 * emulation fixture is loaded, the engine ends up with two matching
+	 * U4025QW entries (the real hidraw and the synthetic emulated one);
+	 * without inhibiting the real one, the engine picks it for install
+	 * by enumeration order, our write_firmware refuses, and the
+	 * emulated entry never gets exercised. The inhibit makes the
+	 * emulated entry the only viable target. */
+	if (!fu_device_has_flag(device, FWUPD_DEVICE_FLAG_EMULATED)) {
+		g_warning("dell-monitor-rt: setup skipped — device is not "
+			  "tagged FWUPD_DEVICE_FLAG_EMULATED, refusing to "
+			  "send vendor commands to real hardware until the "
+			  "protocol is fully validated under emulation");
+		fu_device_set_version(device, "0.0.0-real-hw-locked");
+		fu_device_inhibit(device,
+				  "dell-monitor-rt-real-hw-locked",
+				  "real-hardware install disabled during plugin "
+				  "bring-up; load an emulation fixture to test");
+		return TRUE;
+	}
+
 	/* Step 1: enable vendor-command mode (the auth bytes are the
 	 * RealTek vendor ID 0x0BDA placed at wire bytes 4-5). */
 	if (!fu_dell_monitor_rt_device_vcmd(self,
@@ -742,6 +772,58 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 }
 
 /*
+ * Trigger bootloader-mode entry on the upstream-hub MCU.
+ *
+ * After this completes, the MCU drops its firmware-mode HID interface
+ * and re-enumerates as the bootloader interface (a fresh hidraw node
+ * with a different device descriptor — observed as 0x1100 → bootloader
+ * VID/PID in our captures). fwupd waits for the re-enumeration via the
+ * device's remove_delay (set to 60 s in init).
+ *
+ * Wire sequence — recovered from frames 43780-43786 of the recap pcap
+ * captures/u4025qw-update-recap-20260502-185321.pcapng. The opcode
+ * 0xE9 is sent only 4× in the entire 880k-frame capture, exclusively
+ * here, immediately before each firmware-mode interface drops off the
+ * bus to come back as the bootloader. Both invocations carry zero
+ * subcmd, zero arg, and no payload, and Dell's binary fires them
+ * back-to-back without waiting for an interrupt-IN ack between them.
+ *
+ * Why two writes? The MCU appears to require the trigger to be acked
+ * twice before it commits to disconnecting (likely a deliberate "are
+ * you sure" debounce — single accidental writes won't brick the
+ * firmware mode). We mirror that behavior to stay symmetric with the
+ * canonical capture; in the captured fixture this means our event
+ * pattern matches Dell's exactly so the emulation framework can pair
+ * both writes against recorded events.
+ *
+ * After this returns, no further IO is performed against the firmware-
+ * mode hidraw fd — the fd is about to become invalid as the device
+ * disconnects. The next phase (block writes against the bootloader
+ * interface) runs against a freshly-enumerated FuDevice instance.
+ */
+static gboolean
+fu_dell_monitor_rt_device_enter_bootloader(FuDellMonitorRtDevice *self,
+					   GError **error)
+{
+	for (guint i = 0; i < 2; i++) {
+		if (!fu_dell_monitor_rt_device_vcmd(self,
+						    DELL_MONITOR_RT_DIR_WRITE,
+						    DELL_MONITOR_RT_OPCODE_BOOTLOADER_ENTER,
+						    0x00,
+						    0x00,
+						    NULL,
+						    0,
+						    error)) {
+			g_prefix_error(error,
+				       "bootloader-enter trigger %u failed: ",
+				       i);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+/*
  * write_firmware — stub.
  *
  * Real installs are not yet wired up. This placeholder exists so the
@@ -782,28 +864,50 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 	       fu_dell_monitor_rt_firmware_get_product(fw_container),
 	       fu_dell_monitor_rt_firmware_get_fw_version(fw_container));
 
-	/* First real IO from inside write_firmware: re-read the hub MCU's
-	 * firmware version. This is a known-good vcmd round-trip our setup()
-	 * already exercises, so when running under emulation it should
-	 * replay against the recorded fixture without surprises. Confirms
-	 * that the IO helpers are reachable from the install code path —
-	 * once that's working we replace this with the bootloader-entry
-	 * sequence and start writing real firmware blocks. */
+	/* SAFETY GUARD — refuse to issue any device IO unless fwupd has
+	 * tagged us as emulated. During development we can only run against
+	 * the captured fixture; real-hardware writes risk bricking the
+	 * monitor (the bootloader-entry trigger especially). The guard fires
+	 * specifically because our existing converter-produced fixture is in
+	 * FuUsbDevice format while our plugin attaches to a FuHidrawDevice,
+	 * so emulation-load builds a synthetic FuUsbDevice that our plugin
+	 * never sees — the device our plugin DOES see stays real, with the
+	 * EMULATED flag clear, and any IO falls through to /dev/hidrawN.
+	 * Lift this guard once we have either (a) a fixture in matching
+	 * FuHidrawDevice format with a BackendId that lines up with the
+	 * real device's sysfs path, captured via fwupdtool emulation-tag +
+	 * emulation-save, or (b) explicit user opt-in for real-hardware
+	 * testing once we trust the protocol. */
+	if (!fu_device_has_flag(device, FWUPD_DEVICE_FLAG_EMULATED)) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_SUPPORTED,
+				    "dell-monitor-rt write_firmware refuses to run "
+				    "against real hardware until the bootloader / "
+				    "block-write / commit protocol is fully "
+				    "validated under emulation. Re-emulate with a "
+				    "fixture whose BackendId matches this device "
+				    "and FWUPD_DEVICE_FLAG_EMULATED will be set.");
+		return FALSE;
+	}
+
+	/* Bootloader entry — the first half of any real install. Drops the
+	 * MCU's firmware-mode interface and triggers re-enumeration as the
+	 * bootloader interface. Block writes / verify / commit will dispatch
+	 * against the freshly-enumerated bootloader-mode FuDevice in a
+	 * follow-up phase; for now this gets us past the first re-enum
+	 * boundary so we can validate the emulation pipeline carries us
+	 * through it cleanly. */
 	{
 		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
-		g_autofree gchar *hub_version = NULL;
 		g_autoptr(GError) error_local = NULL;
-		if (!fu_dell_monitor_rt_device_read_version(self,
-							    &hub_version,
-							    &error_local)) {
-			g_warning("[stub-trace] hub-version re-read inside write_firmware "
-				  "FAILED: %s",
-				  error_local->message);
-		} else {
-			g_warning("[stub-trace] hub-version re-read inside write_firmware "
-				  "got '%s'",
-				  hub_version);
+		if (!fu_dell_monitor_rt_device_enter_bootloader(self, &error_local)) {
+			g_prefix_error(&error_local, "bootloader entry: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
 		}
+		g_info("dell-monitor-rt: bootloader-entry trigger sent — "
+		       "device should be re-enumerating");
 	}
 
 	components = fu_firmware_get_images(firmware);
