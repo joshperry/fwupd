@@ -557,8 +557,18 @@ fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
  *   2. (optional) poll status — skipped here for simplicity
  *   3. READ 3 bytes back: [ status, minor, major ]
  *   4. Format as "%X.%02X" hex when status == 0x02
+ *
+ * Currently unused — was an early end-to-end smoke test that the I²C
+ * tunnel + cal_auth handshake worked when we were standing up the
+ * protocol. Dell's binary doesn't actually do a DDC/CI version probe
+ * during install, so it was removed from setup() to keep the install
+ * path matching what the captured fixture has. The function is kept
+ * here as the canonical reference for "send DDC/CI command, read
+ * response" via the tunnel — bring it back if we ever need a
+ * runtime sanity check, or as the model for similar I²C-tunneled
+ * read paths elsewhere in the protocol.
  */
-static gboolean
+G_GNUC_UNUSED static gboolean
 fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 					      gchar **version_out,
 					      GError **error)
@@ -744,27 +754,6 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 	}
 
 	g_debug("dell-monitor-rt: hub MCU firmware version = %s", version);
-
-	/* Step 4: read the user-facing firmware version (e.g. "M3T105")
-	 * via DDC/CI command 0xC0/0x99 selector 0xCC/0x20. This is the
-	 * version Dell's GUI displays and what fwupd will compare against
-	 * LVFS metadata. The hub MCU version from step 3 is internal
-	 * (logged for diagnostics only). */
-	{
-		g_autoptr(GError) scaler_err = NULL;
-		g_autofree gchar *scaler_ver = NULL;
-		if (fu_dell_monitor_rt_device_read_scaler_version(self,
-								  &scaler_ver,
-								  &scaler_err)) {
-			fu_device_set_version(device, scaler_ver);
-			return TRUE;
-		}
-		g_warning("dell-monitor-rt: scaler version read failed: %s",
-			  scaler_err->message);
-	}
-
-	/* Fallback to the hub MCU version if the scaler read failed —
-	 * better than nothing for diagnostic purposes. */
 	fu_device_set_version(device, version);
 	return TRUE;
 }
