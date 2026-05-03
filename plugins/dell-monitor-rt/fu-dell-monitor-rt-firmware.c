@@ -575,6 +575,10 @@ fu_dell_monitor_rt_firmware_init(FuDellMonitorRtFirmware *self)
 {
 	self->name_table = g_ptr_array_new_with_free_func(g_free);
 	self->panel_bound = g_ptr_array_new_with_free_func(g_free);
+	fu_firmware_add_image_gtype(FU_FIRMWARE(self),
+				    FU_TYPE_DELL_MONITOR_RT_FIRMWARE_COMPONENT);
+	fu_firmware_set_size_max(FU_FIRMWARE(self),
+				 FU_DELL_MONITOR_RT_FIRMWARE_MAX_PAYLOAD_SIZE * 2);
 }
 
 static void

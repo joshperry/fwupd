@@ -20,3 +20,4 @@
 [HIDRAW\VEN_0BDA&DEV_1100]
 Plugin = dell_monitor_rt
 Name = U4025QW
+VersionFormat = plain

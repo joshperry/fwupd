@@ -11,6 +11,8 @@
 #include <linux/hidraw.h>
 
 #include "fu-dell-monitor-rt-device.h"
+#include "fu-dell-monitor-rt-firmware-component.h"
+#include "fu-dell-monitor-rt-firmware.h"
 
 /*
  * Wire format (verified against captured pcap of Dell's own updater
@@ -729,6 +731,7 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 	fu_device_add_protocol(FU_DEVICE(self), "com.dell.monitor.rt");
 	fu_device_set_summary(FU_DEVICE(self),
 			      "Dell monitor with RealTek scaler (Wistron ISP)");
+	fu_device_set_firmware_gtype(FU_DEVICE(self), FU_TYPE_DELL_MONITOR_RT_FIRMWARE);
 	fu_device_add_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_UPDATABLE);
 	fu_device_add_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_SIGNED_PAYLOAD);
 	fu_device_set_remove_delay(FU_DEVICE(self), 60 * 1000); /* 60 s for re-enum */
@@ -738,10 +741,83 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 				     FU_IO_CHANNEL_OPEN_FLAG_WRITE);
 }
 
+/*
+ * write_firmware — stub.
+ *
+ * Real installs are not yet wired up. This placeholder exists so the
+ * full pipeline (cab → FuFirmware parse → component-walk → device
+ * dispatch) plumbs end-to-end against the captured emulation fixture.
+ * Each iteration of real protocol code we add gets immediate test
+ * coverage by replaying via:
+ *
+ *   fwupdtool emulation-load fixture.zip cab.cab
+ *
+ * The walk currently logs each component's id, version, primary
+ * chip-type GUID, and decrypted-payload size, then returns success
+ * without touching the device. As we land protocol code (bootloader
+ * entry, block writes, commit, …) it slots in here, dispatched per
+ * component by `chip_guid` against a small handler table.
+ */
+static gboolean
+fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
+					 FuFirmware *firmware,
+					 FuProgress *progress,
+					 FwupdInstallFlags flags,
+					 GError **error)
+{
+	FuDellMonitorRtFirmware *fw_container;
+	GPtrArray *components;
+
+	if (!FU_IS_DELL_MONITOR_RT_FIRMWARE(firmware)) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_FILE,
+			    "expected FuDellMonitorRtFirmware, got %s",
+			    G_OBJECT_TYPE_NAME(firmware));
+		return FALSE;
+	}
+	fw_container = FU_DELL_MONITOR_RT_FIRMWARE(firmware);
+
+	g_info("dell-monitor-rt: write_firmware (stub) — product=%s fw_version=%s",
+	       fu_dell_monitor_rt_firmware_get_product(fw_container),
+	       fu_dell_monitor_rt_firmware_get_fw_version(fw_container));
+
+	components = fu_firmware_get_images(firmware);
+	for (guint i = 0; i < components->len; i++) {
+		FuDellMonitorRtFirmwareComponent *component =
+		    FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT(g_ptr_array_index(components, i));
+		const gchar *chip_guid = fu_dell_monitor_rt_firmware_component_get_field_string(
+		    component,
+		    FU_DELL_MONITOR_RT_FIRMWARE_FIELD_CHIP_GUID);
+		const gchar *version = fu_dell_monitor_rt_firmware_component_get_field_string(
+		    component,
+		    FU_DELL_MONITOR_RT_FIRMWARE_FIELD_VERSION);
+		g_autoptr(GBytes) payload = fu_firmware_get_bytes(FU_FIRMWARE(component), NULL);
+		g_info("  component[%u] id=%s version=%s chip_guid=%s payload=%" G_GSIZE_FORMAT
+		       " bytes (NOT FLASHED — write_firmware stub)",
+		       i,
+		       fu_firmware_get_id(FU_FIRMWARE(component)),
+		       version != NULL ? version : "<encrypted>",
+		       chip_guid != NULL ? chip_guid : "<encrypted>",
+		       payload != NULL ? g_bytes_get_size(payload) : 0);
+	}
+
+	/* TODO: per-component dispatch table keyed by chip_guid will go here.
+	 *   55afe793-… → RTS5409S hub MCU update path
+	 *   5f3ba3d6-… → RTS5418E secondary
+	 *   ea72869e-… → likely Parade scaler
+	 *   etc.
+	 * Each handler will translate the per-component plaintext firmware
+	 * blob into the appropriate I²C-tunneled write_block / commit /
+	 * reset sequence, exactly mirroring what Dell's updater does. */
+	return TRUE;
+}
+
 static void
 fu_dell_monitor_rt_device_class_init(FuDellMonitorRtDeviceClass *klass)
 {
 	FuDeviceClass *device_class = FU_DEVICE_CLASS(klass);
 	device_class->probe = fu_dell_monitor_rt_device_probe;
 	device_class->setup = fu_dell_monitor_rt_device_setup;
+	device_class->write_firmware = fu_dell_monitor_rt_device_write_firmware;
 }
