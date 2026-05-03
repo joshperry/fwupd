@@ -173,6 +173,98 @@ fu_backend_emulate_func(void)
 }
 
 static void
+fu_backend_emulate_hidraw_func(void)
+{
+	gboolean ret;
+	guint added_cnt = 0;
+	FuDevice *device;
+	g_autoptr(FuBackend) backend = NULL;
+	g_autoptr(FuContext) ctx = fu_context_new();
+	g_autoptr(GError) error = NULL;
+
+	/* A FuHidrawDevice fixture entry. The leading three Events
+	 * (GetBackendParent / ReadProp HID_ID / ReadProp HID_NAME) are
+	 * what the EMULATED branch of fu_device_get_backend_parent_with_subsystem
+	 * (in fu_hidraw_device_probe) reads instead of doing a real sysfs walk.
+	 * Without those events the EMULATED branch can't satisfy the query and
+	 * probe falls back to live mode, which fails because there's no real
+	 * sysfs entry behind a synthetic device.
+	 *
+	 * This test is a regression-canary for the fixture-load path: until
+	 * fu_backend_from_json constructs the synthetic donor with its
+	 * backend already wired up, fu_hidraw_device_probe's call into
+	 * fu_device_get_backend_parent_with_subsystem trips a `priv->backend
+	 * == NULL` guard *before* the EMULATED branch can run. The result
+	 * is that the entire fixture-load aborts with
+	 * "no backend set for device" and the synthetic device is never
+	 * added — silently breaking any plugin that wants to test its
+	 * hidraw I/O via emulation-load. */
+	const gchar *json = "{\n"
+			    "  \"FwupdVersion\": \"" PACKAGE_VERSION "\",\n"
+			    "  \"UsbDevices\": [\n"
+			    "    {\n"
+			    "      \"Created\": \"2026-05-01T00:00:00Z\",\n"
+			    "      \"GType\": \"FuHidrawDevice\",\n"
+			    "      \"BackendId\": \"/sys/test/0003:0BDA:1100.0001/hidraw/hidraw0\",\n"
+			    "      \"Subsystem\": \"hidraw\",\n"
+			    "      \"DeviceFile\": \"/dev/hidraw0\",\n"
+			    "      \"IdVendor\": 3034,\n"
+			    "      \"IdProduct\": 4352,\n"
+			    "      \"Events\": [\n"
+			    "        {\n"
+			    "          \"Id\": \"GetBackendParent:Subsystem=hid\",\n"
+			    "          \"GType\": \"FuUdevDevice\",\n"
+			    "          \"BackendId\": \"/sys/test/0003:0BDA:1100.0001\"\n"
+			    "        },\n"
+			    "        {\n"
+			    "          \"Id\": \"ReadProp:Key=HID_ID\",\n"
+			    "          \"Data\": \"0003:00000BDA:00001100\"\n"
+			    "        },\n"
+			    "        {\n"
+			    "          \"Id\": \"ReadProp:Key=HID_NAME\",\n"
+			    "          \"Data\": \"USB HID (0bda:1100)\"\n"
+			    "        }\n"
+			    "      ]\n"
+			    "    }\n"
+			    "  ]\n"
+			    "}";
+
+	/* GTypes are registered lazily; force-register FuHidrawDevice so
+	 * fu_backend_from_json's g_type_from_name() lookup finds it. */
+	g_type_ensure(FU_TYPE_HIDRAW_DEVICE);
+
+	/* FuHidrawDevice's probe path consults the quirks subsystem when
+	 * generating instance IDs; make sure it's initialized so the probe
+	 * doesn't trip on a quirks-not-loaded assertion. */
+	ret = fu_context_load_quirks(ctx, FU_QUIRKS_LOAD_FLAG_NO_CACHE, &error);
+	g_assert_no_error(error);
+	g_assert_true(ret);
+
+	backend = g_object_new(FU_TYPE_BACKEND,
+			       "context",
+			       ctx,
+			       "name",
+			       "udev",
+			       "device-gtype",
+			       FU_TYPE_UDEV_DEVICE,
+			       NULL);
+	g_signal_connect(FU_BACKEND(backend),
+			 "device-added",
+			 G_CALLBACK(fu_backend_emulate_count_cb),
+			 &added_cnt);
+
+	ret = fwupd_codec_from_json_string(FWUPD_CODEC(backend), json, &error);
+	g_assert_no_error(error);
+	g_assert_true(ret);
+	g_assert_cmpint(added_cnt, ==, 1);
+
+	device = fu_backend_lookup_by_id(backend, "/sys/test/0003:0BDA:1100.0001/hidraw/hidraw0");
+	g_assert_no_error(error);
+	g_assert_nonnull(device);
+	g_assert_true(fu_device_has_flag(device, FWUPD_DEVICE_FLAG_EMULATED));
+}
+
+static void
 fu_backend_func(void)
 {
 	FuDevice *dev;
@@ -227,5 +319,6 @@ main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/fwupd/backend", fu_backend_func);
 	g_test_add_func("/fwupd/backend/emulate", fu_backend_emulate_func);
+	g_test_add_func("/fwupd/backend/emulate/hidraw", fu_backend_emulate_hidraw_func);
 	return g_test_run();
 }
