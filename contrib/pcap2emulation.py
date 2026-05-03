@@ -604,9 +604,9 @@ class Pcap2Emulation:
                                 pass
                             else:
                                 sys.stderr.write(
-                                    "Unknown descriptor type: " + descriptor_type
+                                    f"Unknown descriptor type: 0x{descriptor_type:02x}"
+                                    " — skipping\n"
                                 )
-                                exit(1)
 
                     elif "usb_usb_bmRequestType_type" in layers:
                         # Found vendor CONTROL URB request
