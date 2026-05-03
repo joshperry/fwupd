@@ -472,9 +472,11 @@ fu_dell_monitor_rt_hex_encode_upper(const guint8 *in, gsize in_len, gchar *out)
 /*
  * Verify the per-bundle ECDSA-secp521r1-with-SHA3_512 signature in the
  * trailer against the firmware bytes preceding it. Uses the trailer's
- * own embedded signing pubkey — see task #25 about elevating this to a
- * real chain of trust by also verifying that pubkey is signed by a root
- * key baked into libhub.so.
+ * own embedded signing pubkey — see the trust-model note in the header
+ * for why this is necessarily self-attestation rather than a real chain
+ * of trust (no Dell/Wistron root key exists in the shipped binaries,
+ * confirmed by exhaustive search across libhub.so, the main updater,
+ * and the data files in both U4025QW and U3224KB bundles).
  *
  * Dell wraps the firmware in a layered hash before signing (verified
  * empirically against captures/load-vec-*.bin):
