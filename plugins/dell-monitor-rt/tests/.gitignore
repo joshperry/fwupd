@@ -1,0 +1,7 @@
+# Local-only emulation fixture. The full install/reload events run to
+# ~101 MB uncompressed JSON, which is far outside upstream's "test
+# fixtures stay <20 KB" convention (see README.md for context). The
+# zip contains setup + install + reload phases for inner-loop dev,
+# regeneratable from captures/u4025qw-update-recap-20260502-185321.pcapng
+# via contrib/pcap2emulation.py.
+u4025qw-emulation.zip

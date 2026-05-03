@@ -1,0 +1,85 @@
+{
+  "FwupdVersion": "2.0.0",
+  "UsbDevices": [
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1101.0034/hidraw/hidraw52",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw52",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4353,
+      "Events": []
+    },
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1100.0036/hidraw/hidraw54",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw54",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4352,
+      "Events": []
+    },
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1101.003D/hidraw/hidraw61",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw61",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4353,
+      "Events": []
+    },
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1100.003F/hidraw/hidraw63",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw63",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4352,
+      "Events": []
+    },
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1101.0044/hidraw/hidraw68",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw68",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4353,
+      "Events": []
+    },
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1100.0047/hidraw/hidraw71",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw71",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4352,
+      "Events": []
+    },
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1101.0051/hidraw/hidraw81",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw81",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4353,
+      "Events": []
+    },
+    {
+      "GType": "FuHidrawDevice",
+      "BackendId": "/sys/devices/pci0000:00/0000:00:14.0/usb3/3-1/3-1:1.0/0003:0BDA:1100.0053/hidraw/hidraw83",
+      "Subsystem": "hidraw",
+      "DeviceFile": "/dev/hidraw83",
+      "Created": 0,
+      "IdVendor": 3034,
+      "IdProduct": 4352,
+      "Events": []
+    }
+  ]
+}

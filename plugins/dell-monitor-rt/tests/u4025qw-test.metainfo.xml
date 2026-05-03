@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="firmware">
+  <id>com.dell.U4025QW.firmware</id>
+  <name>U4025QW Test Firmware</name>
+  <summary>Synthetic test cab for the dell-monitor-rt plugin's emulation-mode bring-up</summary>
+  <description>
+    <p>Wraps the M3T105 .upg in a cab so fwupdtool emulation-load can drive
+       the plugin's write_firmware path against a recorded device fixture.
+       Not for real installs — version is bumped past what real hardware
+       reports so the install step actually triggers.</p>
+  </description>
+  <provides>
+    <firmware type="flashed">eaf02a45-30c0-5098-8b8f-3d3034863e38</firmware>
+  </provides>
+  <url type="homepage">https://github.com/joshperry/fwupd/tree/dell-monitor-rt</url>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <developer_name>Dell / Wistron</developer_name>
+  <releases>
+    <release version="M3T999" date="2026-05-02">
+      <description>
+        <p>Synthetic version bump (real bundle is M3T105) so the install
+           path triggers under emulation.</p>
+      </description>
+    </release>
+  </releases>
+  <custom>
+    <value key="LVFS::VersionFormat">plain</value>
+    <value key="LVFS::UpdateProtocol">com.dell.monitor.rt</value>
+  </custom>
+</component>

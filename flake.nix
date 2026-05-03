@@ -67,6 +67,83 @@
             "$MESON_BUILD_DIR/_local/lib/fwupd/quirks.d/builtin.quirk.gz"
           echo "staged $MESON_BUILD_DIR/_local/lib/fwupd/quirks.d/builtin.quirk.gz"
         '';
+
+        # End-to-end emulation runner for the dell-monitor-rt plugin.
+        # Assembles the test cab from the in-tree metainfo + the .upg
+        # firmware blob in the dell-u4025qw-fw companion repo, then
+        # drives `fwupdtool emulation-load` against the local fixture
+        # zip. Idempotent: skips the steps whose outputs already exist.
+        #
+        # Designed for inner-loop work on plugins/dell-monitor-rt/. The
+        # plugin keeps a write_firmware safety guard that refuses to run
+        # without FWUPD_DEVICE_FLAG_EMULATED on its device, so even if
+        # the fixture mismatches at the BackendId level the install
+        # aborts before any IO can leak to real hardware.
+        runEmuScript = pkgs.writeShellScriptBin "dell-monitor-rt-emu" ''
+          set -euo pipefail
+
+          : "''${MESON_BUILD_DIR:=build}"
+          plugin_dir="plugins/dell-monitor-rt"
+          tests_dir="$plugin_dir/tests"
+
+          # Prefer locations relative to the fwupd checkout; fall back to
+          # a sibling clone of dell-u4025qw-fw next to fwupd's parent.
+          companion_default="''${DELL_U4025QW_FW_DIR:-../dell-u4025qw-fw}"
+          upg_default="$companion_default/extracted/usr/share/Dell/firmware/U4025QW/M3T105/DELL_U4025QW_LGD_4FCF2_M3T105_20251009.upg"
+
+          fixture="$tests_dir/u4025qw-emulation.zip"
+          metainfo="$tests_dir/u4025qw-test.metainfo.xml"
+          upg="''${DELL_U4025QW_UPG:-$upg_default}"
+
+          # Cab and the firmware-blob staging area live under the meson
+          # build tree so they get cleaned by `rm -rf build` along with
+          # everything else. (Saves an extra .gitignore entry too.)
+          stage="$MESON_BUILD_DIR/_dell-monitor-rt-emu"
+          firmware_blob="$stage/firmware.bin"
+          cab="$stage/u4025qw-test.cab"
+
+          # Sanity checks before doing anything expensive
+          for f in "$metainfo" "$fixture"; do
+            if [[ ! -f "$f" ]]; then
+              echo "missing test asset: $f" >&2
+              if [[ "$f" == "$fixture" ]]; then
+                echo "  (regenerate from pcap; see $tests_dir/README.md)" >&2
+              fi
+              exit 1
+            fi
+          done
+          if [[ ! -f "$upg" ]]; then
+            echo "missing .upg firmware blob: $upg" >&2
+            echo "  set DELL_U4025QW_UPG to override, or clone" >&2
+            echo "  https://github.com/joshperry/dell-u4025qw-fw next to this checkout" >&2
+            exit 1
+          fi
+
+          # Stage the .upg as firmware.bin so build-cabinet picks it up
+          # under the name our metainfo.xml references.
+          mkdir -p "$stage"
+          if [[ ! -f "$firmware_blob" || "$upg" -nt "$firmware_blob" ]]; then
+            echo "staging $upg → $firmware_blob"
+            install -m644 "$upg" "$firmware_blob"
+          fi
+
+          # Build the cab if missing, or if either input is newer.
+          if [[ ! -f "$cab" || "$firmware_blob" -nt "$cab" || "$metainfo" -nt "$cab" ]]; then
+            echo "building $cab"
+            rm -f "$cab"
+            "$MESON_BUILD_DIR/src/fwupdtool" build-cabinet \
+              "$cab" "$firmware_blob" "$metainfo"
+          else
+            echo "cab up-to-date: $cab"
+          fi
+
+          # Run the emulator. Allow extra args (e.g. --verbose) through.
+          echo "running emulation-load against $fixture"
+          exec "$MESON_BUILD_DIR/src/fwupdtool" emulation-load \
+            "$fixture" "$cab" \
+            --plugins dell_monitor_rt \
+            "$@"
+        '';
       in
       {
         # Run/install: the full fwupd, built from this source tree, with
@@ -88,6 +165,7 @@
           packages = with pkgs; [
             mesonConfigureScript
             stageQuirksScript
+            runEmuScript
 
             # Code intelligence
             clang-tools          # clangd, clang-format
@@ -134,6 +212,10 @@ Two build modes:
     fwupd-stage-quirks                   # after editing a .quirk file
     sudo build/src/fwupdtool get-devices
     meson test -C build dell-monitor-rt  # once we have tests
+
+  Plugin emulation (no real hardware touched):
+    dell-monitor-rt-emu                  # build cab + run emulation-load
+    dell-monitor-rt-emu --verbose        # extra args pass through
 
 In-development plugin: plugins/dell-monitor-rt/
 
