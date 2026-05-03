@@ -425,8 +425,15 @@ fu_backend_from_json(FwupdCodec *codec, FwupdJsonObject *json_obj, GError **erro
 			continue;
 		}
 
-		/* create device */
-		device_tmp = g_object_new(device_gtype, "context", priv->ctx, NULL);
+		/* create device — pass the backend at construction so a
+		 * subclass probe that walks the device tree (e.g.
+		 * FuHidrawDevice's "find my hid parent" via
+		 * fu_device_get_backend_parent_with_subsystem) doesn't trip
+		 * the priv->backend == NULL sanity check before reaching the
+		 * EMULATED branch that would have served the answer from
+		 * recorded events. Without this, hidraw fixtures fail to
+		 * load with "no backend set for device". */
+		device_tmp = g_object_new(device_gtype, "context", priv->ctx, "backend", self, NULL);
 		fu_device_add_flag(device_tmp, FWUPD_DEVICE_FLAG_EMULATED);
 		if (fwupd_version != NULL)
 			fu_device_set_fwupd_version(device_tmp, fwupd_version);
