@@ -7,6 +7,7 @@
 #include "config.h"
 
 #include "fu-dell-monitor-rt-crypto.h"
+#include "fu-dell-monitor-rt-ecies.h"
 #include "fu-dell-monitor-rt-firmware-component.h"
 #include "fu-dell-monitor-rt-firmware.h"
 
@@ -431,7 +432,24 @@ fu_dell_monitor_rt_firmware_parse(FuFirmware *firmware,
 				    i);
 			return FALSE;
 		}
-		fu_firmware_set_bytes(FU_FIRMWARE(component), payload);
+		/* Decrypt the ECIES envelope on the spot. The result is the
+		 * plaintext firmware blob plus a 222-byte signature trailer
+		 * that downstream device code can verify if it wants. If
+		 * decryption fails, fall back to the encrypted bytes — the
+		 * structural parse is still useful for diagnostics. */
+		{
+			g_autoptr(GError) ecies_error = NULL;
+			g_autoptr(GBytes) plaintext =
+			    fu_dell_monitor_rt_decrypt_payload(payload, &ecies_error);
+			if (plaintext != NULL) {
+				fu_firmware_set_bytes(FU_FIRMWARE(component), plaintext);
+			} else {
+				g_debug("ECIES decrypt of binary entry %u failed: %s",
+					i,
+					ecies_error->message);
+				fu_firmware_set_bytes(FU_FIRMWARE(component), payload);
+			}
+		}
 	}
 
 	/* Second pass: decrypt every metadata field with the per-product
