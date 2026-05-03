@@ -156,12 +156,21 @@ fu_dell_monitor_rt_device_vcmd(FuDellMonitorRtDevice *self,
 }
 
 /*
- * Send a READ-direction vcmd and pull the response with GET_REPORT
- * (HID INPUT report). The response buffer is 193 bytes including the
- * leading Report ID byte.
+ * Send a vcmd and pull a response via HIDIOCGINPUT.
+ *
+ * The wire-byte-0 direction selector (DIR_WRITE 0x40 / DIR_READ 0xC0)
+ * is opcode-specific in this protocol — Dell's binary uses 0xC0 for
+ * pure read-back commands (e.g. opcode 0x09 get_self_fw_version) and
+ * 0x40 for action commands that also stage a response (e.g. opcode
+ * 0xE1 cal_auth). The chip apparently accepts the "wrong" direction
+ * for some opcodes too, but matching Dell's pattern is necessary for
+ * emulation replays — the recorded fixture only contains the byte
+ * patterns Dell actually emitted. The response buffer is 193 bytes
+ * including the leading Report ID byte.
  */
 static gboolean
 fu_dell_monitor_rt_device_vcmd_read(FuDellMonitorRtDevice *self,
+				    guint8 dir,
 				    guint8 opcode,
 				    guint8 subcmd,
 				    guint8 arg,
@@ -172,7 +181,7 @@ fu_dell_monitor_rt_device_vcmd_read(FuDellMonitorRtDevice *self,
 				    GError **error)
 {
 	if (!fu_dell_monitor_rt_device_vcmd(self,
-					    DELL_MONITOR_RT_DIR_READ,
+					    dir,
 					    opcode,
 					    subcmd,
 					    arg,
@@ -234,6 +243,7 @@ fu_dell_monitor_rt_device_read_version(FuDellMonitorRtDevice *self,
 	guint8 payload[3] = {0x00, 0x00, 0x20};
 
 	if (!fu_dell_monitor_rt_device_vcmd_read(self,
+						 DELL_MONITOR_RT_DIR_READ,
 						 DELL_MONITOR_RT_OPCODE_GET_FW_VERSION,
 						 0x00,
 						 0x00,
@@ -370,8 +380,13 @@ fu_dell_monitor_rt_device_handshake(FuDellMonitorRtDevice *self,
 	const guint8 *challenge;
 
 	/* Step 1+2: send 0x40 e1 01 01 and pull 16-byte challenge via
-	 * HIDIOCGINPUT. Use vcmd_read which does exactly this round-trip. */
+	 * HIDIOCGINPUT. Note the 0x40 (DIR_WRITE) direction byte — for the
+	 * cal_auth opcode Dell's binary frames the request as an "action"
+	 * even though it expects a response back via HIDIOCGINPUT. The
+	 * chip would also accept 0xC0 here, but the captured fixture only
+	 * has the 0x40 variant so emulation needs us to match. */
 	if (!fu_dell_monitor_rt_device_vcmd_read(self,
+						 DELL_MONITOR_RT_DIR_WRITE,
 						 DELL_MONITOR_RT_OPCODE_AUTH,
 						 DELL_MONITOR_RT_AUTH_SUB_REQUEST,
 						 0x01, /* arg byte mirrors subcmd in pcap */
