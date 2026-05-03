@@ -782,6 +782,30 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 	       fu_dell_monitor_rt_firmware_get_product(fw_container),
 	       fu_dell_monitor_rt_firmware_get_fw_version(fw_container));
 
+	/* First real IO from inside write_firmware: re-read the hub MCU's
+	 * firmware version. This is a known-good vcmd round-trip our setup()
+	 * already exercises, so when running under emulation it should
+	 * replay against the recorded fixture without surprises. Confirms
+	 * that the IO helpers are reachable from the install code path —
+	 * once that's working we replace this with the bootloader-entry
+	 * sequence and start writing real firmware blocks. */
+	{
+		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
+		g_autofree gchar *hub_version = NULL;
+		g_autoptr(GError) error_local = NULL;
+		if (!fu_dell_monitor_rt_device_read_version(self,
+							    &hub_version,
+							    &error_local)) {
+			g_warning("[stub-trace] hub-version re-read inside write_firmware "
+				  "FAILED: %s",
+				  error_local->message);
+		} else {
+			g_warning("[stub-trace] hub-version re-read inside write_firmware "
+				  "got '%s'",
+				  hub_version);
+		}
+	}
+
 	components = fu_firmware_get_images(firmware);
 	for (guint i = 0; i < components->len; i++) {
 		FuDellMonitorRtFirmwareComponent *component =
