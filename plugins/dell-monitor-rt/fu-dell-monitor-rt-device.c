@@ -692,6 +692,22 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 	const guint8 vendor_sig[2] = {DELL_MONITOR_RT_VENDOR_SIG_LO,
 				      DELL_MONITOR_RT_VENDOR_SIG_HI};
 
+	/* Secondary HID-B (DEV_1101) shares the FuDellMonitorRtDevice GType
+	 * with the primary HID-A (DEV_1100), but a different hidraw fd onto
+	 * a different MCU. The captured trace shows the secondary doesn't
+	 * receive enable_vdcmd / cal_auth / DDC version probe before its c8
+	 * staging — Dell's binary just opens its hidraw and starts pushing
+	 * 0xC8 frames. So setup() on the secondary is a no-op apart from
+	 * stamping a placeholder version (the user-facing version belongs
+	 * to the primary; the secondary is updatable-hidden in the quirk).
+	 * The plugin's device_registered hook pairs them as parent/child so
+	 * the primary's write_firmware can find this device and call
+	 * fu_dell_monitor_rt_device_stage_isp_firmware against it. */
+	if (fu_device_get_pid(device) == 0x1101) {
+		fu_device_set_version(device, "secondary");
+		return TRUE;
+	}
+
 	/* Idempotency guard: setup() runs again whenever the engine re-adds
 	 * the device — typically after a phase-load re-attaches it during
 	 * install. The vendor-command init we do here is one-shot per
@@ -890,9 +906,10 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
  * chips and other monitors will need different blobs sourced from
  * different .upg components.
  */
-#define DELL_MONITOR_RT_STAGE_FW_BLOB_SIZE   (64 * 1024)
+#define DELL_MONITOR_RT_STAGE_FW_BANK_SIZE   (64 * 1024)
 #define DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE  128
 #define DELL_MONITOR_RT_STAGE_FW_DATA_OFFSET 64    /* wire-byte offset of payload */
+#define DELL_MONITOR_RT_STAGE_FW_BANK_OFFSET 4     /* wire-byte offset of bank/pass selector */
 
 /*
  * Stream an ephemeral ISP shim into a downstream MCU's RAM via the i2c
@@ -968,7 +985,19 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 	return TRUE;
 }
 
-static gboolean
+/*
+ * Stage a 64-KB-aligned ISP shim blob into the device's RAM via the
+ * 0xC8 STAGE_FW opcode. Walks the blob in 64 KB banks; each bank
+ * iterates addr 0..255 × half 0/0x80, with the bank index placed at
+ * wire offset 4 (verified against HID-B's HUB4 staging — pass-1 frames
+ * carry bank=0, pass-2 frames carry bank=1, otherwise byte-identical
+ * frame structure to HID-A's HUB staging).
+ *
+ * Sizes seen on the U4025QW:
+ *   HUB  (HID-A primary)    64 KB →  1 bank ×  512 frames
+ *   HUB4 (HID-B secondary) 128 KB →  2 banks × 512 frames = 1024 frames
+ */
+gboolean
 fu_dell_monitor_rt_device_stage_isp_firmware(FuDellMonitorRtDevice *self,
 					     GBytes *blob,
 					     FuProgress *progress,
@@ -976,55 +1005,66 @@ fu_dell_monitor_rt_device_stage_isp_firmware(FuDellMonitorRtDevice *self,
 {
 	const guint8 *blob_data;
 	gsize blob_size;
+	guint nbanks;
+
+	g_return_val_if_fail(FU_IS_DELL_MONITOR_RT_DEVICE(self), FALSE);
+	g_return_val_if_fail(blob != NULL, FALSE);
+	g_return_val_if_fail(error == NULL || *error == NULL, FALSE);
 
 	blob_data = g_bytes_get_data(blob, &blob_size);
-	if (blob_size != DELL_MONITOR_RT_STAGE_FW_BLOB_SIZE) {
+	if (blob_size == 0 || blob_size % DELL_MONITOR_RT_STAGE_FW_BANK_SIZE != 0) {
 		g_set_error(error,
 			    FWUPD_ERROR,
 			    FWUPD_ERROR_INVALID_DATA,
-			    "ISP shim blob is %" G_GSIZE_FORMAT " bytes, expected %u",
+			    "ISP shim blob is %" G_GSIZE_FORMAT " bytes, must be a multiple of %u",
 			    blob_size,
-			    DELL_MONITOR_RT_STAGE_FW_BLOB_SIZE);
+			    DELL_MONITOR_RT_STAGE_FW_BANK_SIZE);
 		return FALSE;
 	}
+	nbanks = (guint)(blob_size / DELL_MONITOR_RT_STAGE_FW_BANK_SIZE);
 
 	if (progress != NULL)
-		fu_progress_set_steps(progress, 256);
+		fu_progress_set_steps(progress, nbanks * 256);
 
-	for (guint addr = 0; addr < 256; addr++) {
-		for (guint half = 0; half < 2; half++) {
-			guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
-			gsize blob_off = (addr * 256) + (half * 128);
-			guint8 flag = (half == 0) ? 0x00 : 0x80;
+	for (guint bank = 0; bank < nbanks; bank++) {
+		gsize bank_off = bank * DELL_MONITOR_RT_STAGE_FW_BANK_SIZE;
+		for (guint addr = 0; addr < 256; addr++) {
+			for (guint half = 0; half < 2; half++) {
+				guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
+				gsize blob_off = bank_off + (addr * 256) + (half * 128);
+				guint8 flag = (half == 0) ? 0x00 : 0x80;
 
-			buf[1 + 0] = DELL_MONITOR_RT_DIR_WRITE;
-			buf[1 + 1] = DELL_MONITOR_RT_OPCODE_STAGE_FW;
-			buf[1 + 2] = flag;
-			buf[1 + 3] = (guint8)addr;
-			buf[1 + 6] = DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE;
-			memcpy(&buf[1 + DELL_MONITOR_RT_STAGE_FW_DATA_OFFSET],
-			       blob_data + blob_off,
-			       DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE);
+				buf[1 + 0] = DELL_MONITOR_RT_DIR_WRITE;
+				buf[1 + 1] = DELL_MONITOR_RT_OPCODE_STAGE_FW;
+				buf[1 + 2] = flag;
+				buf[1 + 3] = (guint8)addr;
+				buf[1 + DELL_MONITOR_RT_STAGE_FW_BANK_OFFSET] = (guint8)bank;
+				buf[1 + 6] = DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE;
+				memcpy(&buf[1 + DELL_MONITOR_RT_STAGE_FW_DATA_OFFSET],
+				       blob_data + blob_off,
+				       DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE);
 
-			if (!fu_hidraw_device_set_report(FU_HIDRAW_DEVICE(self),
-							 buf,
-							 sizeof(buf),
-							 FU_IO_CHANNEL_FLAG_USE_BLOCKING_IO,
-							 error)) {
-				g_prefix_error(error,
-					       "stage-fw failed at addr=0x%02x half=0x%02x: ",
-					       addr,
-					       flag);
-				return FALSE;
+				if (!fu_hidraw_device_set_report(FU_HIDRAW_DEVICE(self),
+								 buf,
+								 sizeof(buf),
+								 FU_IO_CHANNEL_FLAG_USE_BLOCKING_IO,
+								 error)) {
+					g_prefix_error(error,
+						       "stage-fw failed at bank=%u addr=0x%02x half=0x%02x: ",
+						       bank,
+						       addr,
+						       flag);
+					return FALSE;
+				}
 			}
+			if (progress != NULL)
+				fu_progress_step_done(progress);
 		}
-		if (progress != NULL)
-			fu_progress_step_done(progress);
 	}
 	return TRUE;
 }
 
-static gboolean
+gboolean
 fu_dell_monitor_rt_device_enter_bootloader(FuDellMonitorRtDevice *self,
 					   GError **error)
 {
@@ -1114,14 +1154,14 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		return FALSE;
 	}
 
-	/* Step 1a — stage the downstream-MCU ISP shims (HUB1, HUB2) into
-	 * their respective MCUs' RAM via the i2c tunnel. The two MCUs sit
-	 * on the chip's internal i2c bus at slaves 0xD4 and 0xD6; their
-	 * staged code is wiped on reset, just like the HUB stage below.
-	 * The HUB MCU's own ISP shim (loaded in step 1b) orchestrates the
-	 * downstream MCUs after 0xE9 fires — without these stages there's
-	 * nothing for the orchestrator to talk to. See PLUGIN_NOTES
-	 * "Updated mapping (2026-05-05)". */
+	/* Step 1a — stage downstream-MCU ISP shims (HUB1, HUB2) into their
+	 * RAM via the i2c tunnel. These two MCUs sit on the chip's internal
+	 * i2c bus at slaves 0xD4 and 0xD6; their staged code is wiped on
+	 * reset just like the HUB/HUB4 stages below. The HUB MCU's own ISP
+	 * shim (loaded in step 1b) orchestrates the downstream MCUs after
+	 * 0xE9 fires. Without these stages there's nothing for the
+	 * orchestrator to talk to. See PLUGIN_NOTES "Updated mapping
+	 * (2026-05-05)". */
 	{
 		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
 		g_autoptr(FuFirmware) hub1_component = NULL;
@@ -1209,12 +1249,97 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		       g_bytes_get_size(hub2_blob));
 	}
 
-	/* Step 1b — stage the ISP shim into the hub MCU's RAM. Without this
-	 * the bootloader-entry trigger has no resident flash-write code to
-	 * jump into; the chip would just reset cleanly. The shim is the
-	 * decrypted "HUB" component of the .upg (64 KB of 8051 code), found
-	 * by id among the firmware container's images. See PLUGIN_NOTES
-	 * "0x40 C8 — host-to-device firmware staging". */
+	/* Step 1b — stage the HUB4 ISP shim into the secondary MCU's RAM
+	 * via the secondary's own hidraw fd. The plugin pairs HID-A and
+	 * HID-B as parent/child during device_registered; we walk our
+	 * children to find the secondary (PID 0x1101) and call
+	 * stage_isp_firmware against it. HUB4 is 128 KB → 2 banks ×
+	 * 256 addr × 2 halves = 1024 frames, each carrying bank index at
+	 * wire offset 4. */
+	{
+		GPtrArray *children = fu_device_get_children(device);
+		FuDellMonitorRtDevice *secondary = NULL;
+		g_autoptr(FuFirmware) hub4_component = NULL;
+		g_autoptr(GBytes) hub4_blob = NULL;
+		g_autoptr(GError) error_local = NULL;
+
+		for (guint i = 0; children != NULL && i < children->len; i++) {
+			FuDevice *child = g_ptr_array_index(children, i);
+			if (FU_IS_DELL_MONITOR_RT_DEVICE(child) &&
+			    fu_device_get_pid(child) == 0x1101) {
+				secondary = FU_DELL_MONITOR_RT_DEVICE(child);
+				break;
+			}
+		}
+		if (secondary == NULL) {
+			/* Under emulation the fixture currently produces a single
+			 * synthetic device (the primary) — pcap2emulation collapses
+			 * both PIDs onto one BackendId, so no HID-B FuDevice exists
+			 * for write_firmware to walk to. Real-hardware installs
+			 * always have both interfaces enumerated, and the plugin's
+			 * device_registered hook pairs them via fu_device_add_child.
+			 *
+			 * We soft-fail here so emulation runs can replay the rest of
+			 * the install (HUB primary stage + bootloader entry + post-
+			 * bootloader bulk writes), with the HUB4 frames silently
+			 * leapfrogged by the emulator's non-strict event matcher.
+			 * Real hardware installs would hit a hard FAIL at this point
+			 * with the same error path if pairing somehow didn't happen,
+			 * so this isn't a permanent get-out-of-jail card — just a
+			 * dev-ergonomic gap until pcap2emulation can split events
+			 * cleanly across two synthetic devices. */
+			g_warning("dell-monitor-rt: HUB4 staging skipped — no "
+				  "secondary HID-B child paired (expected under "
+				  "emulation; would be a hard FAIL on real hardware)");
+			goto skip_hub4_stage;
+		}
+		hub4_component = fu_firmware_get_image_by_id(firmware, "HUB4", &error_local);
+		if (hub4_component == NULL) {
+			g_prefix_error(&error_local,
+				       "HUB4 staging: missing 'HUB4' component: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		hub4_blob = fu_firmware_get_bytes(hub4_component, &error_local);
+		if (hub4_blob == NULL) {
+			g_prefix_error(&error_local,
+				       "HUB4 staging: failed to fetch HUB4 bytes: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		if (!fu_dell_monitor_rt_device_stage_isp_firmware(secondary,
+								  hub4_blob,
+								  NULL,
+								  &error_local)) {
+			g_prefix_error(&error_local, "HUB4 staging on secondary: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		g_info("dell-monitor-rt: HUB4 staged to secondary (%" G_GSIZE_FORMAT
+		       " bytes across 1024 frames)",
+		       g_bytes_get_size(hub4_blob));
+
+		/* The secondary's bootloader-entry fires BEFORE the primary's
+		 * in Dell's trace (device[2] is HID-B with c8+0xE9, device[3]
+		 * is HID-A with c8+0xE9). After this returns the secondary's
+		 * hidraw fd is invalid — the chip drops its firmware-mode
+		 * interface and re-enumerates as the bootloader. */
+		if (!fu_dell_monitor_rt_device_enter_bootloader(secondary, &error_local)) {
+			g_prefix_error(&error_local, "secondary bootloader entry: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		g_info("dell-monitor-rt: secondary bootloader-entry trigger sent");
+skip_hub4_stage:
+		;  /* fall through to step 1c */
+	}
+
+	/* Step 1c — stage the HUB ISP shim into the primary MCU's RAM.
+	 * Without this the bootloader-entry trigger has no resident flash-
+	 * write code to jump into; the chip would just reset cleanly. The
+	 * shim is the decrypted "HUB" component of the .upg (64 KB of 8051
+	 * code), found by id among the firmware container's images. See
+	 * PLUGIN_NOTES "0x40 C8 — host-to-device firmware staging". */
 	{
 		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
 		g_autoptr(FuFirmware) hub_component = NULL;

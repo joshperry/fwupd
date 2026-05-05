@@ -1,23 +1,32 @@
-# Dell U4025QW — upstream hub MCU's HID interface (DEV_1100).
+# Dell U4025QW — both HID interfaces of the upstream hub MCU pair.
 #
 # Match by the hidraw VID:DEV pair (kernel HID enumeration), not by USB
 # VID:PID, so all I/O goes through the kernel hid-generic driver — the
 # same path Dell's hidapi-based binary uses.
 #
-# The U4025QW exposes two HID interfaces (DEV_1100 and DEV_1101) on
-# different USB sub-paths of its internal hub. They are *not* the same
-# chip:
-#   - DEV_1100: RTS5409S upstream hub MCU. Supports the cal_auth
-#     handshake, opens an I²C tunnel to the FL5500 scaler, and is the
-#     interface through which the M3T105 firmware update flows. This
-#     is what we match here.
-#   - DEV_1101: a secondary MCU (its hub MCU version reads as 2.06 vs
-#     1100's 2.04, confirming distinct firmware). Its cal_auth-style
-#     handshake STALLs, suggesting a different protocol gate. We don't
-#     yet know its update path. Adding support is a separate task — we
-#     just don't enumerate it here, which keeps fwupd's device list
-#     clean to one logical entry per monitor.
+# The U4025QW exposes two HID interfaces on different USB sub-paths of
+# its internal hub. They are *not* the same chip:
+#   - DEV_1100: RTS5409S upstream hub MCU. Owns the cal_auth handshake,
+#     opens an i2c tunnel to the FL5500 scaler, stages downstream-MCU
+#     ISP shims (HUB1 → 0xD4, HUB2 → 0xD6) over the i2c tunnel, stages
+#     the HUB ISP shim (64 KB) into its own RAM via 0xC8, and is the
+#     interface the engine talks to for the install. **This is the
+#     primary; updatable.**
+#   - DEV_1101: RTS5418E secondary hub MCU. Same protocol family but a
+#     different chip; owns the HUB4 ISP shim (128 KB) staging via 0xC8,
+#     fires its own bootloader-entry trigger on its own hidraw fd, and
+#     runs in lock-step with the primary during the post-bootloader
+#     bulk flash phase. The plugin pairs the two as parent/child during
+#     `device_registered` so the primary's `write_firmware` can reach
+#     in and stage HUB4 onto the secondary. **Updatable-hidden so
+#     fwupd's device list stays clean.**
 [HIDRAW\VEN_0BDA&DEV_1100]
 Plugin = dell_monitor_rt
 Name = U4025QW
 VersionFormat = plain
+
+[HIDRAW\VEN_0BDA&DEV_1101]
+Plugin = dell_monitor_rt
+Name = U4025QW (secondary)
+VersionFormat = plain
+Flags = updatable-hidden
