@@ -551,24 +551,20 @@ fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
 
 /*
  * Read the FL5500 scaler chip's firmware version via the I²C tunnel.
- * Mirrors RTS5409s_IIC_API::read_fw_version in libhub.so:
- *   1. WRITE 5 bytes to DDC/CI target: { 0x25, 0x03, 0x00, 0x00, 0x02 }
- *      → register 0x0325 (LE), read-mode byte 0x02
- *   2. (optional) poll status — skipped here for simplicity
- *   3. READ 3 bytes back: [ status, minor, major ]
- *   4. Format as "%X.%02X" hex when status == 0x02
+ * Sends a DDC/CI vendor command (51 84 c0 99 cc 20 0e) to target
+ * 0x6E and parses the M3T105-style ASCII string out of the reply.
+ * This is the version Dell's GUI displays — the user-facing
+ * "M3T105"-format identifier — and what fwupd should compare against
+ * LVFS release metadata. The hub MCU version (read via opcode 0x09)
+ * is internal-only diagnostics.
  *
- * Currently unused — was an early end-to-end smoke test that the I²C
- * tunnel + cal_auth handshake worked when we were standing up the
- * protocol. Dell's binary doesn't actually do a DDC/CI version probe
- * during install, so it was removed from setup() to keep the install
- * path matching what the captured fixture has. The function is kept
- * here as the canonical reference for "send DDC/CI command, read
- * response" via the tunnel — bring it back if we ever need a
- * runtime sanity check, or as the model for similar I²C-tunneled
- * read paths elsewhere in the protocol.
+ * Verified byte-for-byte against frames in
+ * captures/u4025qw-update-recap-20260502-185321.pcapng: Dell's
+ * binary issues exactly the same 51 84 c0 99 cc 20 0e write to
+ * target 0x6E and gets back 51 88 c1 99 4d3354313035 cf with
+ * "M3T105" at offset 4 of the DDC/CI reply.
  */
-G_GNUC_UNUSED static gboolean
+static gboolean
 fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 					      gchar **version_out,
 					      GError **error)
@@ -677,9 +673,24 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 {
 	FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
 	g_autoptr(GError) error_local = NULL;
-	g_autofree gchar *version = NULL;
 	const guint8 vendor_sig[2] = {DELL_MONITOR_RT_VENDOR_SIG_LO,
 				      DELL_MONITOR_RT_VENDOR_SIG_HI};
+
+	/* Idempotency guard: setup() runs again whenever the engine re-adds
+	 * the device — typically after a phase-load re-attaches it during
+	 * install. The vendor-command init we do here is one-shot per
+	 * device lifetime (Dell's binary doesn't re-send enable_vdcmd /
+	 * cal_auth after a mid-install device cycle either), and
+	 * re-running it under emulation advances the event cursor past
+	 * the bootloader-entry events that write_firmware expects to find
+	 * next. Short-circuit if the version is already set, which means
+	 * a previous setup() pass already populated it. */
+	if (fu_device_get_version(device) != NULL) {
+		g_debug("dell-monitor-rt: setup re-entry — version already set "
+			"to %s, skipping vendor-command init",
+			fu_device_get_version(device));
+		return TRUE;
+	}
 
 	/* SAFETY GUARD — see write_firmware for the full rationale. setup()
 	 * issues real writes too (enable_vdcmd, cal_auth response, i2c_write
@@ -756,17 +767,32 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 		return TRUE;
 	}
 
-	/* Step 3: ask for the hub MCU firmware version. */
+	/* Step 3: read the user-facing firmware version (e.g. "M3T105") via
+	 * a DDC/CI request to the FL5500 scaler — same byte sequence Dell's
+	 * binary uses (51 84 c0 99 cc 20 0e to target 0x6E, then read back).
+	 *
+	 * We deliberately don't call read_version (the hub MCU's internal
+	 * 0x09 opcode probe) here: Dell's binary doesn't issue 0xC0 0x09
+	 * during the firmware-update flow, so emitting it would land our
+	 * plugin's event cursor in the wrong place under emulation —
+	 * fwupd's non-strict matcher leapfrogs forward to find a matching
+	 * event ID, advancing past the cal_auth + i2c_write events the
+	 * scaler probe needs next. Following Dell's sequence
+	 * (enable_vdcmd → enable_high_clock → cal_auth → i2c_write →
+	 * i2c_read) keeps the event cursor in step with the fixture. */
 	g_clear_error(&error_local);
-	if (!fu_dell_monitor_rt_device_read_version(self, &version, &error_local)) {
-		g_warning("dell-monitor-rt: get_self_fw_version failed: %s",
-			  error_local->message);
-		fu_device_set_version(device, "0.0.0-no-version");
-		return TRUE;
+	{
+		g_autofree gchar *scaler_ver = NULL;
+		if (!fu_dell_monitor_rt_device_read_scaler_version(self,
+								   &scaler_ver,
+								   &error_local)) {
+			g_warning("dell-monitor-rt: scaler version read failed: %s",
+				  error_local->message);
+			fu_device_set_version(device, "0.0.0-no-scaler-version");
+			return TRUE;
+		}
+		fu_device_set_version(device, scaler_ver);
 	}
-
-	g_debug("dell-monitor-rt: hub MCU firmware version = %s", version);
-	fu_device_set_version(device, version);
 	return TRUE;
 }
 

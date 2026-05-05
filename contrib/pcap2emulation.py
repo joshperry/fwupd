@@ -958,7 +958,19 @@ def convert_phases_to_hidraw(phases: List[Dict[str, Any]]) -> List[Dict[str, Any
                     "BackendId": backend_id,
                     "Subsystem": "hidraw",
                     "DeviceFile": f"/dev/hidraw{hidraw_n}",
-                    "Created": 0,
+                    # Pick a fixed (non-zero, non-now) ISO 8601 timestamp so
+                    # the SAME synthetic device persists across emulator phase
+                    # transitions. fu_backend_device_added overrides
+                    # `created_usec=0` to "now" (fu-backend.c:81), which would
+                    # leave each phase's loaded device looking different from
+                    # the one already in the device list — fwupd then takes
+                    # the "new device, add" path and creates a fresh
+                    # synthetic, blowing away any setup that already ran. A
+                    # stable non-zero Created keeps the lookup-by-id branch
+                    # at fu-backend.c:454 matching, so events get attached
+                    # to the existing emulated device and the event cursor
+                    # carries forward through phase boundaries.
+                    "Created": "2026-01-01T00:00:00.000000Z",
                     "IdVendor": vid,
                     "IdProduct": pid,
                     "Events": _structural_events_for_hidraw(backend_id, vid, pid),
