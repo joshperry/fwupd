@@ -82,6 +82,21 @@ static const guint8 DELL_MONITOR_RT_U4025QW_SYNKEY_SEED[18] = {
  * over DDC/CI; the 8-bit form 0x6E is what appears on the wire. */
 #define DELL_MONITOR_RT_I2C_TARGET_DDCCI 0x6E
 
+/* Downstream MCU i2c slave addresses on the chip's internal bus. These
+ * receive ephemeral 8051 ISP shims (HUB1, HUB2) ahead of bootloader
+ * entry; the staged code lives in the target MCU's RAM and is wiped on
+ * reset. See PLUGIN_NOTES "Updated mapping (2026-05-05)". */
+#define DELL_MONITOR_RT_I2C_TARGET_HUB1 0xD4
+#define DELL_MONITOR_RT_I2C_TARGET_HUB2 0xD6
+
+/* Per-frame i2c sub-command header for the downstream-MCU RAM loader.
+ * Every 0xC6 frame in the HUB1/HUB2 stream begins with this prefix at
+ * payload offset 0; the 64 bytes after are sequential firmware data. */
+#define DELL_MONITOR_RT_I2C_LOADER_CMD     0x13
+#define DELL_MONITOR_RT_I2C_LOADER_SUB     0x40
+#define DELL_MONITOR_RT_I2C_LOADER_CHUNK   64
+#define DELL_MONITOR_RT_I2C_LOADER_FRAME   (2 + DELL_MONITOR_RT_I2C_LOADER_CHUNK)
+
 /* Default I²C bus speed config — written into wire byte 10. 0 = default
  * (matches the "this+0x40 == 0" we see right after open). */
 #define DELL_MONITOR_RT_I2C_DEFAULT_SPEED 0x00
@@ -879,6 +894,80 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 #define DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE  128
 #define DELL_MONITOR_RT_STAGE_FW_DATA_OFFSET 64    /* wire-byte offset of payload */
 
+/*
+ * Stream an ephemeral ISP shim into a downstream MCU's RAM via the i2c
+ * tunnel (opcode 0xC6). Used for HUB1 → 0xD4 and HUB2 → 0xD6 — both
+ * fire BEFORE bootloader entry, both go through HID-A. Each frame
+ * carries `DELL_MONITOR_RT_I2C_LOADER_CMD/SUB` (0x13 0x40) followed by
+ * `DELL_MONITOR_RT_I2C_LOADER_CHUNK` (64) bytes of sequential firmware
+ * data. Verified bytewise against the captured pcap: HUB1.fw is the
+ * concatenation of 2048 such 64-byte chunks, HUB2.fw is 1024 chunks.
+ *
+ * The single cal_auth handshake performed by our caller covers the
+ * entire blob — Dell's binary doesn't refresh between chunks within a
+ * single blob (only between blobs and around setup). The downstream
+ * MCU acks each chunk via 0xD6 status read in the captured trace, but
+ * we omit the polling reads here: the emulator leapfrogs past unmatched
+ * read events, and on real hardware we expect the writes to be flow-
+ * controlled by the HID transport itself (each SET_REPORT blocks until
+ * the chip drains its buffer).
+ */
+static gboolean
+fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
+					       guint8 i2c_target,
+					       GBytes *blob,
+					       FuProgress *progress,
+					       GError **error)
+{
+	const guint8 *blob_data;
+	gsize blob_size;
+	guint nchunks;
+
+	blob_data = g_bytes_get_data(blob, &blob_size);
+	if (blob_size == 0 ||
+	    blob_size % DELL_MONITOR_RT_I2C_LOADER_CHUNK != 0) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "downstream-MCU blob size %" G_GSIZE_FORMAT
+			    " not a multiple of %u",
+			    blob_size,
+			    DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+		return FALSE;
+	}
+	nchunks = (guint)(blob_size / DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+
+	if (progress != NULL)
+		fu_progress_set_steps(progress, nchunks);
+
+	for (guint i = 0; i < nchunks; i++) {
+		guint8 frame[DELL_MONITOR_RT_I2C_LOADER_FRAME];
+
+		frame[0] = DELL_MONITOR_RT_I2C_LOADER_CMD;
+		frame[1] = DELL_MONITOR_RT_I2C_LOADER_SUB;
+		memcpy(&frame[2],
+		       blob_data + (i * DELL_MONITOR_RT_I2C_LOADER_CHUNK),
+		       DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+
+		if (!fu_dell_monitor_rt_device_i2c_write(self,
+							 i2c_target,
+							 frame,
+							 sizeof(frame),
+							 error)) {
+			g_prefix_error(error,
+				       "downstream-MCU stage to 0x%02x failed at chunk %u/%u: ",
+				       i2c_target,
+				       i,
+				       nchunks);
+			return FALSE;
+		}
+
+		if (progress != NULL)
+			fu_progress_step_done(progress);
+	}
+	return TRUE;
+}
+
 static gboolean
 fu_dell_monitor_rt_device_stage_isp_firmware(FuDellMonitorRtDevice *self,
 					     GBytes *blob,
@@ -1025,7 +1114,102 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		return FALSE;
 	}
 
-	/* Step 1 — stage the ISP shim into the hub MCU's RAM. Without this
+	/* Step 1a — stage the downstream-MCU ISP shims (HUB1, HUB2) into
+	 * their respective MCUs' RAM via the i2c tunnel. The two MCUs sit
+	 * on the chip's internal i2c bus at slaves 0xD4 and 0xD6; their
+	 * staged code is wiped on reset, just like the HUB stage below.
+	 * The HUB MCU's own ISP shim (loaded in step 1b) orchestrates the
+	 * downstream MCUs after 0xE9 fires — without these stages there's
+	 * nothing for the orchestrator to talk to. See PLUGIN_NOTES
+	 * "Updated mapping (2026-05-05)". */
+	{
+		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
+		g_autoptr(FuFirmware) hub1_component = NULL;
+		g_autoptr(FuFirmware) hub2_component = NULL;
+		g_autoptr(GBytes) hub1_blob = NULL;
+		g_autoptr(GBytes) hub2_blob = NULL;
+		g_autoptr(GError) error_local = NULL;
+		guint8 hub_key[8];
+
+		/* HUB1 → i2c slave 0xD4 (128 KB, 2048 chunks of 64 B). */
+		hub1_component = fu_firmware_get_image_by_id(firmware, "HUB1", &error_local);
+		if (hub1_component == NULL) {
+			g_prefix_error(&error_local,
+				       "downstream-MCU stage: missing 'HUB1' component: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		hub1_blob = fu_firmware_get_bytes(hub1_component, &error_local);
+		if (hub1_blob == NULL) {
+			g_prefix_error(&error_local,
+				       "downstream-MCU stage: failed to fetch HUB1 bytes: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+
+		/* HUB2 → i2c slave 0xD6 (64 KB, 1024 chunks of 64 B). */
+		hub2_component = fu_firmware_get_image_by_id(firmware, "HUB2", &error_local);
+		if (hub2_component == NULL) {
+			g_prefix_error(&error_local,
+				       "downstream-MCU stage: missing 'HUB2' component: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		hub2_blob = fu_firmware_get_bytes(hub2_component, &error_local);
+		if (hub2_blob == NULL) {
+			g_prefix_error(&error_local,
+				       "downstream-MCU stage: failed to fetch HUB2 bytes: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+
+		/* The i2c tunnel is cal_auth-gated; refresh once before each
+		 * blob (matches Dell's binary, which holds one auth ticket
+		 * across the whole HUB1 stream then re-auths before HUB2). */
+		fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+					      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+					      hub_key);
+
+		if (!fu_dell_monitor_rt_device_handshake(self, hub_key, &error_local)) {
+			g_prefix_error(&error_local, "downstream-MCU stage (HUB1): ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		if (!fu_dell_monitor_rt_device_stage_downstream_mcu(
+			self,
+			DELL_MONITOR_RT_I2C_TARGET_HUB1,
+			hub1_blob,
+			NULL,
+			&error_local)) {
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		g_info("dell-monitor-rt: HUB1 staged to i2c 0x%02x (%" G_GSIZE_FORMAT
+		       " bytes)",
+		       (unsigned)DELL_MONITOR_RT_I2C_TARGET_HUB1,
+		       g_bytes_get_size(hub1_blob));
+
+		if (!fu_dell_monitor_rt_device_handshake(self, hub_key, &error_local)) {
+			g_prefix_error(&error_local, "downstream-MCU stage (HUB2): ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		if (!fu_dell_monitor_rt_device_stage_downstream_mcu(
+			self,
+			DELL_MONITOR_RT_I2C_TARGET_HUB2,
+			hub2_blob,
+			NULL,
+			&error_local)) {
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		g_info("dell-monitor-rt: HUB2 staged to i2c 0x%02x (%" G_GSIZE_FORMAT
+		       " bytes)",
+		       (unsigned)DELL_MONITOR_RT_I2C_TARGET_HUB2,
+		       g_bytes_get_size(hub2_blob));
+	}
+
+	/* Step 1b — stage the ISP shim into the hub MCU's RAM. Without this
 	 * the bootloader-entry trigger has no resident flash-write code to
 	 * jump into; the chip would just reset cleanly. The shim is the
 	 * decrypted "HUB" component of the .upg (64 KB of 8051 code), found
