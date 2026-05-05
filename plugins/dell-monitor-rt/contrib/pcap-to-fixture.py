@@ -186,6 +186,26 @@ def _add_report_id_prefix(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rewritten
 
 
+def _is_c8_staging(event: Dict[str, Any]) -> bool:
+    """A Write event whose payload starts 0x00 (Report-ID) + 0x40 (DIR_WRITE)
+    + 0xC8 (STAGE_FW) — i.e. one of the 512 ISP-shim-staging frames the
+    host emits before the bootloader-entry trigger."""
+    eid = event.get("Id", "")
+    if not eid.startswith("Write:Data="):
+        return False
+    data_b64 = eid.split("Data=", 1)[1].split(",")[0]
+    try:
+        decoded = base64.b64decode(data_b64) if data_b64 else b""
+    except Exception:
+        return False
+    return (
+        len(decoded) >= 3
+        and decoded[0] == HIDRAW_REPORT_ID_PREFIX
+        and decoded[1] == 0x40
+        and decoded[2] == 0xC8
+    )
+
+
 def _is_bootloader_enter(event: Dict[str, Any]) -> bool:
     """A Write event whose payload starts 0x00 (Report-ID) + 0x40 (DIR_WRITE)
     + 0xE9 (BOOTLOADER_ENTER) — i.e. the trigger our plugin sends to
@@ -291,15 +311,33 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
             for ev in setup_events
             if ev.get("Id", "").startswith(("GetBackendParent:", "ReadProp:"))
         ]
+        # The plugin's write_firmware does the ISP-shim staging (512 c8
+        # writes) right before the bootloader-entry trigger. Those c8
+        # events sit in the pre-trigger setup_events stream — but the
+        # engine consumes install.json events during install phase, not
+        # setup.json. Without copying the c8 staging across, the
+        # plugin's first c8 write hits "no event with ID" when fwupd
+        # looks up the event in install.json's empty pre-trigger area.
+        # Pull just the c8 frames from the pre-trigger stream and
+        # prepend them after the structural events in install.json.
+        # Eventually staging should move into a detach() method that
+        # runs in fwupd's DETACH phase, with its own detach.json — at
+        # which point this duplication can go away.
+        c8_staging = [
+            ev
+            for ev in setup_events
+            if _is_c8_staging(ev)
+        ]
         # setup.json carries the structural probes + pre-trigger events
         setup_dev = {k: v for k, v in dev.items() if k != "Events"}
         setup_dev["Events"] = setup_events
         setup_devs.append(setup_dev)
         # install.json: re-prepend the structural events so any post-
-        # disconnect re-probe finds them, then the post-trigger wire
-        # events.
+        # disconnect re-probe finds them, then the c8 staging frames so
+        # write_firmware's pre-trigger stage can replay, then the post-
+        # trigger wire events.
         install_dev = {k: v for k, v in dev.items() if k != "Events"}
-        install_dev["Events"] = list(struct_events) + install_events
+        install_dev["Events"] = list(struct_events) + list(c8_staging) + install_events
         install_devs.append(install_dev)
 
     setup_phase = _build_phase(setup_devs)

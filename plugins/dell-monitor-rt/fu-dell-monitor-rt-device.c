@@ -48,6 +48,7 @@
 #define DELL_MONITOR_RT_OPCODE_GET_FW_VERSION        0x09  /* hub MCU only */
 #define DELL_MONITOR_RT_OPCODE_AUTH                  0xE1  /* I²C tunnel auth */
 #define DELL_MONITOR_RT_OPCODE_BOOTLOADER_ENTER      0xE9  /* re-enumerate as bootloader */
+#define DELL_MONITOR_RT_OPCODE_STAGE_FW              0xC8  /* load firmware chunk into RAM */
 #define DELL_MONITOR_RT_OPCODE_I2C_WRITE             0xC6  /* I²C tunnel write */
 #define DELL_MONITOR_RT_OPCODE_I2C_READ              0xD6  /* I²C tunnel read req */
 
@@ -843,6 +844,97 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
  * disconnects. The next phase (block writes against the bootloader
  * interface) runs against a freshly-enumerated FuDevice instance.
  */
+/*
+ * Stage the ISP shim firmware into the upstream-hub MCU's RAM ahead of
+ * the bootloader-entry trigger. After 0xE9 the chip jumps into this
+ * staged code; without staging there's no flash-write code resident
+ * and 0xE9 just causes a clean reset.
+ *
+ * Wire transport — recovered from the recap pcap and matched bytewise
+ * against the decrypted .upg HUB component (see PLUGIN_NOTES "0x40 C8
+ * — host-to-device firmware staging"). Each frame carries 128 bytes of
+ * 8051 code with this layout:
+ *
+ *   wire offset 0  : 0x40 (DIR_WRITE)
+ *   wire offset 1  : 0xC8 (STAGE_FW opcode)
+ *   wire offset 2  : flag — 0x00 = lower half of 256-byte block,
+ *                           0x80 = upper half
+ *   wire offset 3  : addr — 256-byte block index, 0..255
+ *   wire offset 4-5: zero
+ *   wire offset 6  : 0x80 (payload length = 128 = sizeof high half)
+ *   wire offset 7  : zero
+ *   wire offset 8-63 : zero pad
+ *   wire offset 64-191: 128 bytes of firmware data
+ *
+ * Iteration order matches Dell's binary: addr 0 lo half, addr 0 hi
+ * half, addr 1 lo, addr 1 hi, ..., addr 255 hi half. 256 addresses ×
+ * 2 halves = 512 SET_REPORTs to load a full 64 KB blob.
+ *
+ * The blob argument must be exactly 64 KB (= the size of the .upg's
+ * HUB component for the U4025QW's primary RTS5409S hub MCU). Other
+ * chips and other monitors will need different blobs sourced from
+ * different .upg components.
+ */
+#define DELL_MONITOR_RT_STAGE_FW_BLOB_SIZE   (64 * 1024)
+#define DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE  128
+#define DELL_MONITOR_RT_STAGE_FW_DATA_OFFSET 64    /* wire-byte offset of payload */
+
+static gboolean
+fu_dell_monitor_rt_device_stage_isp_firmware(FuDellMonitorRtDevice *self,
+					     GBytes *blob,
+					     FuProgress *progress,
+					     GError **error)
+{
+	const guint8 *blob_data;
+	gsize blob_size;
+
+	blob_data = g_bytes_get_data(blob, &blob_size);
+	if (blob_size != DELL_MONITOR_RT_STAGE_FW_BLOB_SIZE) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "ISP shim blob is %" G_GSIZE_FORMAT " bytes, expected %u",
+			    blob_size,
+			    DELL_MONITOR_RT_STAGE_FW_BLOB_SIZE);
+		return FALSE;
+	}
+
+	if (progress != NULL)
+		fu_progress_set_steps(progress, 256);
+
+	for (guint addr = 0; addr < 256; addr++) {
+		for (guint half = 0; half < 2; half++) {
+			guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
+			gsize blob_off = (addr * 256) + (half * 128);
+			guint8 flag = (half == 0) ? 0x00 : 0x80;
+
+			buf[1 + 0] = DELL_MONITOR_RT_DIR_WRITE;
+			buf[1 + 1] = DELL_MONITOR_RT_OPCODE_STAGE_FW;
+			buf[1 + 2] = flag;
+			buf[1 + 3] = (guint8)addr;
+			buf[1 + 6] = DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE;
+			memcpy(&buf[1 + DELL_MONITOR_RT_STAGE_FW_DATA_OFFSET],
+			       blob_data + blob_off,
+			       DELL_MONITOR_RT_STAGE_FW_CHUNK_SIZE);
+
+			if (!fu_hidraw_device_set_report(FU_HIDRAW_DEVICE(self),
+							 buf,
+							 sizeof(buf),
+							 FU_IO_CHANNEL_FLAG_USE_BLOCKING_IO,
+							 error)) {
+				g_prefix_error(error,
+					       "stage-fw failed at addr=0x%02x half=0x%02x: ",
+					       addr,
+					       flag);
+				return FALSE;
+			}
+		}
+		if (progress != NULL)
+			fu_progress_step_done(progress);
+	}
+	return TRUE;
+}
+
 static gboolean
 fu_dell_monitor_rt_device_enter_bootloader(FuDellMonitorRtDevice *self,
 					   GError **error)
@@ -933,13 +1025,48 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		return FALSE;
 	}
 
-	/* Bootloader entry — the first half of any real install. Drops the
-	 * MCU's firmware-mode interface and triggers re-enumeration as the
-	 * bootloader interface. Block writes / verify / commit will dispatch
-	 * against the freshly-enumerated bootloader-mode FuDevice in a
-	 * follow-up phase; for now this gets us past the first re-enum
-	 * boundary so we can validate the emulation pipeline carries us
-	 * through it cleanly. */
+	/* Step 1 — stage the ISP shim into the hub MCU's RAM. Without this
+	 * the bootloader-entry trigger has no resident flash-write code to
+	 * jump into; the chip would just reset cleanly. The shim is the
+	 * decrypted "HUB" component of the .upg (64 KB of 8051 code), found
+	 * by id among the firmware container's images. See PLUGIN_NOTES
+	 * "0x40 C8 — host-to-device firmware staging". */
+	{
+		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
+		g_autoptr(FuFirmware) hub_component = NULL;
+		g_autoptr(GBytes) hub_blob = NULL;
+		g_autoptr(GError) error_local = NULL;
+
+		hub_component = fu_firmware_get_image_by_id(firmware, "HUB", &error_local);
+		if (hub_component == NULL) {
+			g_prefix_error(&error_local,
+				       "ISP shim staging: missing 'HUB' component in .upg: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		hub_blob = fu_firmware_get_bytes(hub_component, &error_local);
+		if (hub_blob == NULL) {
+			g_prefix_error(&error_local,
+				       "ISP shim staging: failed to fetch HUB bytes: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		if (!fu_dell_monitor_rt_device_stage_isp_firmware(self,
+								  hub_blob,
+								  NULL,
+								  &error_local)) {
+			g_prefix_error(&error_local, "ISP shim staging: ");
+			g_propagate_error(error, g_steal_pointer(&error_local));
+			return FALSE;
+		}
+		g_info("dell-monitor-rt: ISP shim staged (64 KB across 512 frames)");
+	}
+
+	/* Step 2 — bootloader entry. Drops the MCU's firmware-mode
+	 * interface and triggers re-enumeration as the bootloader. The
+	 * staged ISP shim from step 1 takes over after the trigger and
+	 * exposes the post-bootloader flash protocol (erase / block-
+	 * write / commit) — implementations TBD. */
 	{
 		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
 		g_autoptr(GError) error_local = NULL;
