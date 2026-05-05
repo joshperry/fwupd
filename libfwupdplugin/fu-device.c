@@ -8242,6 +8242,30 @@ fu_device_load_event(FuDevice *self, const gchar *id, GError **error)
 	for (guint i = priv->event_idx; i < priv->events->len; i++) {
 		FuDeviceEvent *event = g_ptr_array_index(priv->events, i);
 		if (g_strcmp0(fu_device_event_get_id(event), id_hash) == 0) {
+			/* In non-strict mode the matcher leapfrogs over any
+			 * intervening events whose IDs don't match the
+			 * requested one. That makes incremental development
+			 * easy (a partial plugin can find the events it does
+			 * emit even if it's missing intermediate I/O), but it
+			 * also means a "passing" emulation run doesn't prove
+			 * the plugin emits the full recorded sequence in
+			 * order. Log when leapfrogging happens so consumers
+			 * can spot phases they're silently bypassing — the
+			 * count goes to info; the individual skipped event
+			 * IDs go to debug for deeper inspection. */
+			if (i > priv->event_idx) {
+				g_info("skipped %u event(s) to match ID %s [%s]",
+				       i - priv->event_idx,
+				       id,
+				       id_hash);
+				for (guint j = priv->event_idx; j < i; j++) {
+					FuDeviceEvent *skipped =
+					    g_ptr_array_index(priv->events, j);
+					g_debug("  skipped event[%u] ID=%s",
+						j,
+						fu_device_event_get_id(skipped));
+				}
+			}
 			priv->event_idx = i + 1;
 			g_debug("found event with ID %s [%s]", id, id_hash);
 			return event;
