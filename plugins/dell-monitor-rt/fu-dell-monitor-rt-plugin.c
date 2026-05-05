@@ -24,50 +24,27 @@ G_DEFINE_TYPE(FuDellMonitorRtPlugin, fu_dell_monitor_rt_plugin, FU_TYPE_PLUGIN)
  * interfaces; the quirk matches both, but only the primary is
  * user-visible (the secondary is updatable-hidden).
  *
- * The pairing key is the shared USB device path: both BackendIds share
- * the same `/sys/devices/.../usb<N>/<path>/<path>:1.0/` prefix, so we
- * match by stripping the trailing HID instance directory and the
- * hidraw node, then comparing.
+ * Pairing key is (vendor 0x0BDA, EMULATED-flag-state). Real-hardware
+ * devices have distinct USB sysfs paths (the two chips sit on
+ * different downstream ports of an internal hub) and so do their
+ * synthetic counterparts (pcap2emulation gives each captured USB
+ * device its own platform-id), which rules out pairing by shared
+ * sysfs prefix. The flag part of the key keeps real and emulated
+ * devices in separate buckets so a real primary doesn't accidentally
+ * pair with a synthetic secondary when an emulation fixture is loaded
+ * on top of live hardware.
  *
- * Called once for each device at registration time. The first call
- * caches the device into the plugin's per-PID cache; the second call
- * sees the partner already cached and wires up the parent/child link.
+ * This assumes one monitor per (vendor, flag-state) bucket — which
+ * is fine for the U4025QW today; if multi-monitor support is ever
+ * needed, the pairing key would need a per-monitor discriminator.
  */
-static gchar *
-fu_dell_monitor_rt_plugin_usb_interface_path(FuDevice *device)
-{
-	const gchar *backend_id = fu_device_get_backend_id(device);
-	g_autofree gchar *parent = NULL;
-	const gchar *p;
-
-	if (backend_id == NULL)
-		return NULL;
-	/* Strip the /hidraw/hidrawNN suffix → leaves the HID instance dir.
-	 * Example:
-	 *   /sys/.../usb3/3-1/3-1:1.0/0003:0BDA:1100.0036/hidraw/hidraw54
-	 *   ↓ strip "/hidraw/hidraw54"
-	 *   /sys/.../usb3/3-1/3-1:1.0/0003:0BDA:1100.0036
-	 * Then strip the HID instance dir to get the USB interface path:
-	 *   /sys/.../usb3/3-1/3-1:1.0
-	 */
-	parent = g_path_get_dirname(backend_id);
-	p = strrchr(parent, '/');
-	if (p == NULL)
-		return NULL;
-	parent = g_strndup(parent, p - parent);
-	p = strrchr(parent, '/');
-	if (p == NULL)
-		return NULL;
-	return g_strndup(parent, p - parent);
-}
-
 static void
 fu_dell_monitor_rt_plugin_device_registered(FuPlugin *plugin, FuDevice *device)
 {
-	g_autofree gchar *iface_path = NULL;
 	g_autofree gchar *cache_key = NULL;
 	guint16 pid;
 	guint16 partner_pid;
+	gboolean emulated;
 	FuDevice *partner;
 
 	if (!FU_IS_DELL_MONITOR_RT_DEVICE(device))
@@ -87,18 +64,11 @@ fu_dell_monitor_rt_plugin_device_registered(FuPlugin *plugin, FuDevice *device)
 		}
 	}
 	partner_pid = (pid == 0x1100) ? 0x1101 : 0x1100;
-	g_debug("dell-monitor-rt: device_registered pid=0x%04x backend=%s",
-		(unsigned)pid,
-		fu_device_get_backend_id(device));
+	emulated = fu_device_has_flag(device, FWUPD_DEVICE_FLAG_EMULATED);
 
-	iface_path = fu_dell_monitor_rt_plugin_usb_interface_path(device);
-	if (iface_path == NULL) {
-		g_debug("dell-monitor-rt: cannot derive USB interface path from BackendId %s",
-			fu_device_get_backend_id(device));
-		return;
-	}
-
-	cache_key = g_strdup_printf("dell-monitor-rt:%s:0x%04x", iface_path, partner_pid);
+	cache_key = g_strdup_printf("dell-monitor-rt:emul=%u:0x%04x",
+				    emulated ? 1u : 0u,
+				    partner_pid);
 	partner = fu_plugin_cache_lookup(plugin, cache_key);
 	if (partner != NULL) {
 		FuDevice *primary = (pid == 0x1100) ? device : partner;
@@ -110,11 +80,12 @@ fu_dell_monitor_rt_plugin_device_registered(FuPlugin *plugin, FuDevice *device)
 		fu_plugin_cache_remove(plugin, cache_key);
 	} else {
 		g_autofree gchar *self_key =
-		    g_strdup_printf("dell-monitor-rt:%s:0x%04x", iface_path, pid);
+		    g_strdup_printf("dell-monitor-rt:emul=%u:0x%04x",
+				    emulated ? 1u : 0u,
+				    pid);
 		fu_plugin_cache_add(plugin, self_key, device);
 		g_debug("dell-monitor-rt: cached %s under %s, awaiting partner",
-			fu_device_get_id(device),
-			self_key);
+			fu_device_get_id(device), self_key);
 	}
 }
 

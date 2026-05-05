@@ -288,56 +288,31 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
     for dev in flat_devices:
         dev["Events"] = _add_report_id_prefix(dev["Events"])
 
-    # Step 3: split each device's events at the bootloader-enter boundary.
-    # Pre-trigger events (enable_vdcmd, version probes, cal_auth cycles)
-    # go in setup.json so the plugin's setup() can satisfy them. The
-    # trigger and everything after it goes in install.json so the
-    # plugin's write_firmware() can replay against them.
+    # Step 3: emit every device's full event stream into BOTH setup.json
+    # and install.json. The earlier pre/post-trigger split was elegant
+    # but didn't survive multi-device fixtures: fwupd's emulator only
+    # reloads install.json events for devices the engine *explicitly*
+    # fetches via fu_engine_get_device, and child devices that the
+    # primary's write_firmware drives in-place are never fetched —
+    # their setup.json events stay loaded across phases. So if their
+    # bootloader-entry / post-trigger events live only in install.json,
+    # the primary's call into the child fails with "no event with ID
+    # 0xE9" because the child never sees those events.
+    #
+    # Putting the full stream in both phases makes the child's events
+    # available regardless of which phase loaded last, at the cost of
+    # duplicated event blobs in the fixture zip (zip dedup compresses
+    # most of it back). Cursor advancement is monotonic per device, so
+    # carrying the cursor across the phase reload is fine — the
+    # plugin's writes keep matching forward through the same stream.
     setup_devs: List[Dict[str, Any]] = []
     install_devs: List[Dict[str, Any]] = []
     for dev in flat_devices:
-        setup_events, install_events = _split_at_bootloader_enter(dev["Events"])
-        # The structural probe events (GetBackendParent + ReadProp:HID_ID
-        # + ReadProp:HID_NAME) need to be available in every phase that
-        # might re-probe the device, not just the phase that first
-        # enumerates it. After the bootloader-entry trigger the engine
-        # auto-removes the device and waits for replug; when the new
-        # device shows up it re-probes via GetBackendParent / HID_ID.
-        # Without those events at the head of install.json's per-device
-        # entry, that re-probe fails with "no event with ID
-        # ReadProp:Key=HID_ID" and the install aborts.
-        struct_events = [
-            ev
-            for ev in setup_events
-            if ev.get("Id", "").startswith(("GetBackendParent:", "ReadProp:"))
-        ]
-        # The plugin's write_firmware does the ISP-shim staging (512 c8
-        # writes) right before the bootloader-entry trigger. Those c8
-        # events sit in the pre-trigger setup_events stream — but the
-        # engine consumes install.json events during install phase, not
-        # setup.json. Without copying the c8 staging across, the
-        # plugin's first c8 write hits "no event with ID" when fwupd
-        # looks up the event in install.json's empty pre-trigger area.
-        # Pull just the c8 frames from the pre-trigger stream and
-        # prepend them after the structural events in install.json.
-        # Eventually staging should move into a detach() method that
-        # runs in fwupd's DETACH phase, with its own detach.json — at
-        # which point this duplication can go away.
-        c8_staging = [
-            ev
-            for ev in setup_events
-            if _is_c8_staging(ev)
-        ]
-        # setup.json carries the structural probes + pre-trigger events
         setup_dev = {k: v for k, v in dev.items() if k != "Events"}
-        setup_dev["Events"] = setup_events
+        setup_dev["Events"] = list(dev.get("Events", []))
         setup_devs.append(setup_dev)
-        # install.json: re-prepend the structural events so any post-
-        # disconnect re-probe finds them, then the c8 staging frames so
-        # write_firmware's pre-trigger stage can replay, then the post-
-        # trigger wire events.
         install_dev = {k: v for k, v in dev.items() if k != "Events"}
-        install_dev["Events"] = list(struct_events) + list(c8_staging) + install_events
+        install_dev["Events"] = list(dev.get("Events", []))
         install_devs.append(install_dev)
 
     setup_phase = _build_phase(setup_devs)
