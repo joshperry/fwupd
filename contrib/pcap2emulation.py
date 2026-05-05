@@ -8,6 +8,7 @@
 
 import argparse
 import base64
+import copy
 import json
 import os
 import subprocess
@@ -54,7 +55,25 @@ def add_bytes(array: bytearray, string: str, size: int) -> None:
 class Pcap2Emulation:
     def __init__(self, device_ids: str):
         self.device: Dict[str, Any] = {}
-        self.platform_id = ""
+        # PlatformId is allocated per (IdVendor, IdProduct) — the bus_id +
+        # device_address of the first descriptor for each VID:PID is
+        # captured here and reused for every subsequent re-enumeration of
+        # that same logical device. Without per-VID:PID tracking, captures
+        # that exercise multiple distinct devices (e.g. a primary +
+        # secondary MCU pair on the same physical product) collapse onto
+        # one PlatformId and downstream code that uses (PlatformId,
+        # Interface) as a routing key — like convert_phases_to_hidraw —
+        # mis-attributes events from the second device to the first.
+        self.platform_id_by_vid_pid: Dict[Tuple[int, int], str] = {}
+        # Per-(bus, address) device registry for routing events to the
+        # correct device when the capture has multiple concurrently-
+        # active USB devices. _route_to_device(layers) is called at every
+        # event-processing entry point to swap self.device to the device
+        # whose descriptor was last seen at this packet's address.
+        # Without this, _save_event always appends to whichever device
+        # was last assigned via descriptor read — events from the second
+        # device's interleaved bus traffic accumulate on the first.
+        self.devices_by_address: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self.phases: List[Any] = []
         self.device_ids: List[List[str]] = []
         self.interface_index = 0
@@ -81,7 +100,27 @@ class Pcap2Emulation:
                 self.device_ids.append(device_id)
 
     def _save_phase(self) -> None:
-        self.phases.append({"UsbDevices": [self.device]})
+        # Snapshot every device that's accumulated events since the last
+        # save, not just self.device. With multi-device captures, events
+        # for one device routinely land on another's UsbEvents list
+        # between this device's last descriptor read and the next phase
+        # boundary; without snapshotting all of them we'd lose any
+        # device whose descriptor was read first as soon as a second
+        # device's read fires _save_phase. After snapshotting, clear
+        # each live device's UsbEvents so the next phase starts fresh.
+        snapshots: List[Dict[str, Any]] = []
+        for dev in self.devices_by_address.values():
+            if dev.get("UsbEvents") or dev.get("UsbInterfaces"):
+                snapshots.append(copy.deepcopy(dev))
+                dev["UsbEvents"] = []
+        if not snapshots and self.device:
+            # First-ever save before any device got registered (descriptor
+            # handler hasn't yet wired self.device into devices_by_address);
+            # fall back to the previous single-device behavior so captures
+            # without the multi-device wiring still emit something.
+            snapshots = [copy.deepcopy(self.device)]
+        if snapshots:
+            self.phases.append({"UsbDevices": snapshots})
         self.interface_index = 0
         self.endpoint_index = 0
 
@@ -359,7 +398,10 @@ class Pcap2Emulation:
             "DescriptorType": 5,
         }
         for key in table:
-            val = get_int(layers[key][index])
+            try:
+                val = get_int(layers[key][index])
+            except (IndexError, KeyError):
+                continue
             if val != 0:
                 endpoint[table[key]] = val
         return endpoint
@@ -369,6 +411,24 @@ class Pcap2Emulation:
             return
 
         self.device["UsbEvents"].append(event)
+
+    def _route_to_device(self, layers: Dict[str, Any]) -> None:
+        """Switch self.device to the registered device whose descriptor was
+        seen at this event's (bus, address). When the capture has multiple
+        concurrently-active USB devices, descriptor reads alternate but
+        traffic for both flows continuously; without per-event re-routing,
+        every event between two descriptor reads gets attributed to
+        whichever device's descriptor was read most recently."""
+        try:
+            addr_key = (
+                get_int(layers["usb"]["usb_usb_bus_id"]),
+                get_int(layers["usb"]["usb_usb_device_address"]),
+            )
+        except (KeyError, ValueError):
+            return
+        device = self.devices_by_address.get(addr_key)
+        if device is not None:
+            self.device = device
 
     def parse_file(self, file: str) -> None:
         bus_id, addrs = self._get_usb_addrs(file)
@@ -410,6 +470,18 @@ class Pcap2Emulation:
                     usb_port = layers["usbhub_usbhub_setup_Port"]
                     if usb_port == self.usb_port:
                         self.enumerate = True
+
+                # Re-route self.device to the device registered at this
+                # event's (bus, address) for non-descriptor traffic.
+                # Skip descriptor frames — the descriptor handler below
+                # manages self.device explicitly and re-routing first
+                # would corrupt interface/endpoint counters when a
+                # descriptor read for one device arrives between traffic
+                # frames of another. For interrupt and event-style
+                # control frames, routing makes _save_event append to
+                # the correct device when multiple devices are alive.
+                if "usb_usb_bDescriptorType" not in layers:
+                    self._route_to_device(layers)
 
                 if get_int(layers["usb"]["usb_usb_transfer_type"]) == URB_INTERRUPT:
                     event = self._get_interrupt_event(layers)
@@ -454,15 +526,35 @@ class Pcap2Emulation:
                                 ):
                                     self._save_phase()
 
-                                # Create a new USB device
-                                # using a fake PlatformId based on USB bus id and device address,
-                                # this PlatformId should be stable for all recorded devices
-                                if not self.platform_id:
-                                    self.platform_id = "{:x}-{:x}".format(
+                                # Create a new USB device using a fake
+                                # PlatformId based on USB bus id and device
+                                # address. The PlatformId must stay stable
+                                # across re-enumerations of the *same* device
+                                # (so its hidraw entries dedupe across
+                                # phases) but must differ between *distinct*
+                                # devices in the same capture (so their
+                                # events don't get mis-routed onto each
+                                # other in convert_phases_to_hidraw). Cache
+                                # by (IdVendor, IdProduct): first
+                                # descriptor sighting wins, subsequent
+                                # re-enumerations of that same VID:PID
+                                # reuse the cached value.
+                                vid_pid_key = (
+                                    get_int(layers["usb_usb_idVendor"]),
+                                    get_int(layers["usb_usb_idProduct"]),
+                                )
+                                platform_id = self.platform_id_by_vid_pid.get(
+                                    vid_pid_key
+                                )
+                                if platform_id is None:
+                                    platform_id = "{:x}-{:x}".format(
                                         get_int(layers["usb"]["usb_usb_bus_id"]),
                                         get_int(
                                             layers["usb"]["usb_usb_device_address"]
                                         ),
+                                    )
+                                    self.platform_id_by_vid_pid[vid_pid_key] = (
+                                        platform_id
                                     )
                                 # Device re-enumeration is triggered when 'Created' time differs
                                 # from previous phase, this keeps the 'Created' time from previous
@@ -475,7 +567,7 @@ class Pcap2Emulation:
                                     frame_time = self.device["Created"]
                                 self.device = {
                                     "GType": "FuUsbDevice",
-                                    "PlatformId": self.platform_id,
+                                    "PlatformId": platform_id,
                                     "Created": frame_time,
                                     "IdVendor": get_int(layers["usb_usb_idVendor"]),
                                     "IdProduct": get_int(layers["usb_usb_idProduct"]),
@@ -488,6 +580,19 @@ class Pcap2Emulation:
                                     "UsbInterfaces": [],
                                     "UsbEvents": [],
                                 }
+                                # Register under (bus, address) so that
+                                # subsequent events from this device's
+                                # interleaved bus traffic — even when
+                                # another device's descriptor read has
+                                # since taken over self.device — get
+                                # routed back here. See _route_to_device.
+                                addr_key = (
+                                    get_int(layers["usb"]["usb_usb_bus_id"]),
+                                    get_int(
+                                        layers["usb"]["usb_usb_device_address"]
+                                    ),
+                                )
+                                self.devices_by_address[addr_key] = self.device
 
                             elif descriptor_type == DESCRIPTOR_CONFIGURATION:
                                 if "usb_usb_iConfiguration" in layers:
@@ -744,8 +849,12 @@ class Pcap2Emulation:
                         "Unknown frame type: " + layers["usb"]["usb_usb_transfer_type"]
                     )
 
-        # Save the last USB device
-        if "UsbInterfaces" in self.device:
+        # Save any devices that haven't been saved yet — the multi-device
+        # variant of the original "save the last USB device". _save_phase
+        # snapshots every device in devices_by_address, so calling it
+        # here picks up all per-address routed devices in one final
+        # phase regardless of which one happened to be self.device.
+        if self.devices_by_address or "UsbInterfaces" in self.device:
             self._save_phase()
 
 
