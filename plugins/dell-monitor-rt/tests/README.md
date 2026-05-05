@@ -8,7 +8,23 @@ under `fwupdtool emulation-load` without touching real hardware.
 | File | Committed? | Size | Purpose |
 |------|-----------|------|---------|
 | `u4025qw-setup.json` | yes | 2.5 KB | Setup-phase emulation fixture in the upstream `enumeration_data` style. Hooked into the meson `enumeration_data += files(…)` pattern (see `../meson.build`). Drives enumeration and the read-only setup probes. |
-| `u4025qw-emulation.zip` | gitignored | 2.3 MB (~101 MB unzipped) | Full setup + install + reload emulation fixture for inner-loop dev of the install path. Way over upstream's per-fixture size norm (largest committed upstream fixture is 18 KB), so kept local. Regenerable from the source pcap. |
+| `u4025qw-emulation.zip` | gitignored | 2.3 MB (~101 MB unzipped) | Full setup + install + reload emulation fixture for inner-loop dev of the install path. Way over upstream's per-fixture size norm (largest committed upstream fixture is 18 KB), so kept local. **Regenerated automatically by `dell-monitor-rt-emu`** from the source pcap via `contrib/pcap-to-fixture.py` — this file is no longer used directly; the live fixture lives at `build/_dell-monitor-rt-emu/u4025qw-emulation.zip`. |
+
+## Critical: always regenerate the fixture before running
+
+The committed `u4025qw-emulation.zip` is a **historical snapshot kept for
+reference only**. The specializer (`contrib/pcap-to-fixture.py`) evolves
+alongside the plugin (Report-ID prefix handling, phase split at `0xE9`,
+structural-event propagation into `install.json` head, stable Created
+timestamps to keep phase matching stable…). Each plugin change can
+invalidate the cached fixture, so the dev-shell command always
+regenerates from the pcap when the pcap or the specializer is newer
+than the cached fixture under `build/_dell-monitor-rt-emu/`.
+
+If you ever see `failed to probe: no event with ID ReadProp:Key=HID_ID:
+no events loaded` from `emulation-load`, you're running against a stale
+fixture (or the committed one). Re-run `dell-monitor-rt-emu` so the
+specializer rebuilds the fixture from the pcap.
 
 ## Why one is committed and the other isn't
 

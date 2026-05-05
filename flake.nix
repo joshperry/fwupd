@@ -90,40 +90,63 @@
           # a sibling clone of dell-u4025qw-fw next to fwupd's parent.
           companion_default="''${DELL_U4025QW_FW_DIR:-../dell-u4025qw-fw}"
           upg_default="$companion_default/extracted/usr/share/Dell/firmware/U4025QW/M3T105/DELL_U4025QW_LGD_4FCF2_M3T105_20251009.upg"
+          pcap_default="$companion_default/captures/u4025qw-update-recap-20260502-185321.pcapng"
 
-          fixture="$tests_dir/u4025qw-emulation.zip"
           metainfo="$tests_dir/u4025qw-test.metainfo.xml"
           upg="''${DELL_U4025QW_UPG:-$upg_default}"
+          pcap="''${DELL_U4025QW_PCAP:-$pcap_default}"
+          specializer="$plugin_dir/contrib/pcap-to-fixture.py"
 
-          # Cab and the firmware-blob staging area live under the meson
-          # build tree so they get cleaned by `rm -rf build` along with
-          # everything else. (Saves an extra .gitignore entry too.)
+          # Cab + fixture + firmware-blob staging area live under the
+          # meson build tree so they get cleaned by `rm -rf build`. The
+          # fixture lives here too — never use the committed
+          # tests/u4025qw-emulation.zip for runs (it's a snapshot kept for
+          # reference; pcap-to-fixture.py output is the source of truth
+          # because the specializer evolves alongside the plugin and the
+          # fixture must match the plugin's current event expectations).
           stage="$MESON_BUILD_DIR/_dell-monitor-rt-emu"
           firmware_blob="$stage/firmware.bin"
           cab="$stage/u4025qw-test.cab"
+          fixture="$stage/u4025qw-emulation.zip"
 
           # Sanity checks before doing anything expensive
-          for f in "$metainfo" "$fixture"; do
-            if [[ ! -f "$f" ]]; then
-              echo "missing test asset: $f" >&2
-              if [[ "$f" == "$fixture" ]]; then
-                echo "  (regenerate from pcap; see $tests_dir/README.md)" >&2
-              fi
-              exit 1
-            fi
-          done
+          if [[ ! -f "$metainfo" ]]; then
+            echo "missing test asset: $metainfo" >&2
+            exit 1
+          fi
           if [[ ! -f "$upg" ]]; then
             echo "missing .upg firmware blob: $upg" >&2
             echo "  set DELL_U4025QW_UPG to override, or clone" >&2
             echo "  https://github.com/joshperry/dell-u4025qw-fw next to this checkout" >&2
             exit 1
           fi
+          if [[ ! -f "$pcap" ]]; then
+            echo "missing capture pcap: $pcap" >&2
+            echo "  set DELL_U4025QW_PCAP to override, or clone" >&2
+            echo "  https://github.com/joshperry/dell-u4025qw-fw next to this checkout" >&2
+            exit 1
+          fi
+
+          mkdir -p "$stage"
+
+          # Regenerate the fixture if missing or stale relative to the
+          # specializer or pcap. The specializer owns the wire format
+          # (Report-ID prefix, phase split at 0xE9, structural-event
+          # propagation, stable Created timestamps), so any change to
+          # either input must invalidate the cached fixture.
+          if [[ ! -f "$fixture" || \
+                "$pcap" -nt "$fixture" || \
+                "$specializer" -nt "$fixture" ]]; then
+            echo "regenerating $fixture from $pcap"
+            python3 "$specializer" "$pcap" "$fixture"
+          else
+            echo "fixture up-to-date: $fixture"
+          fi
 
           # Stage the .upg as firmware.bin so build-cabinet picks it up
           # under the name our metainfo.xml references.
-          mkdir -p "$stage"
           if [[ ! -f "$firmware_blob" || "$upg" -nt "$firmware_blob" ]]; then
-            echo "staging $upg → $firmware_blob"
+            echo "staging $upg -> $firmware_blob"
             install -m644 "$upg" "$firmware_blob"
           fi
 
@@ -137,11 +160,15 @@
             echo "cab up-to-date: $cab"
           fi
 
-          # Run the emulator. Allow extra args (e.g. --verbose) through.
+          # Run the emulator. --allow-older lets us replay against a cab
+          # that targets the pre-update version; otherwise fwupd refuses
+          # because the fixture's emulated device starts at the post-
+          # update version it was captured at.
           echo "running emulation-load against $fixture"
           exec "$MESON_BUILD_DIR/src/fwupdtool" emulation-load \
             "$fixture" "$cab" \
             --plugins dell_monitor_rt \
+            --allow-older \
             "$@"
         '';
       in
