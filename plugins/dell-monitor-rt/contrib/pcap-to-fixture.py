@@ -277,13 +277,29 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
     install_devs: List[Dict[str, Any]] = []
     for dev in flat_devices:
         setup_events, install_events = _split_at_bootloader_enter(dev["Events"])
+        # The structural probe events (GetBackendParent + ReadProp:HID_ID
+        # + ReadProp:HID_NAME) need to be available in every phase that
+        # might re-probe the device, not just the phase that first
+        # enumerates it. After the bootloader-entry trigger the engine
+        # auto-removes the device and waits for replug; when the new
+        # device shows up it re-probes via GetBackendParent / HID_ID.
+        # Without those events at the head of install.json's per-device
+        # entry, that re-probe fails with "no event with ID
+        # ReadProp:Key=HID_ID" and the install aborts.
+        struct_events = [
+            ev
+            for ev in setup_events
+            if ev.get("Id", "").startswith(("GetBackendParent:", "ReadProp:"))
+        ]
         # setup.json carries the structural probes + pre-trigger events
         setup_dev = {k: v for k, v in dev.items() if k != "Events"}
         setup_dev["Events"] = setup_events
         setup_devs.append(setup_dev)
-        # install.json carries only the post-trigger wire events
+        # install.json: re-prepend the structural events so any post-
+        # disconnect re-probe finds them, then the post-trigger wire
+        # events.
         install_dev = {k: v for k, v in dev.items() if k != "Events"}
-        install_dev["Events"] = install_events
+        install_dev["Events"] = list(struct_events) + install_events
         install_devs.append(install_dev)
 
     setup_phase = _build_phase(setup_devs)

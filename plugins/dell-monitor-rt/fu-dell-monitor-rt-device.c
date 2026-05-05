@@ -703,8 +703,20 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 			  "send vendor commands to real hardware until the "
 			  "protocol is fully validated under emulation");
 		fu_device_set_version(device, "0.0.0-real-hw-locked");
+		/* Use the "hidden" inhibit ID specifically — fu_device_list_
+		 * get_active filters those out (fu-device-list.c:239), so
+		 * the engine's install dispatch never considers this real
+		 * device as a candidate. Without this, the real device and
+		 * the synthetic emulated device both show up in install
+		 * candidates; the engine's composite-update model is
+		 * all-or-nothing, so the real device's safety-guard refusal
+		 * aborts the entire install before write_firmware on the
+		 * synthetic ever runs. With "hidden", only the synthetic
+		 * remains an install candidate when an emulation fixture
+		 * is loaded — which is exactly what we want during
+		 * protocol bring-up. */
 		fu_device_inhibit(device,
-				  "dell-monitor-rt-real-hw-locked",
+				  "hidden",
 				  "real-hardware install disabled during plugin "
 				  "bring-up; load an emulation fixture to test");
 		return TRUE;
