@@ -559,16 +559,20 @@ fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
 }
 
 /*
- * IspTag state register: the chip's last-installed-package marker.
+ * IspTag register: the chip's installed-package marker.
  *
- *   ISP — install is in progress; Dell's binary writes "#ISP#<v>#" at
- *         the start of an install to record "package <v> is currently
- *         flashing." Reading this state on a fresh boot means the
- *         previous install was interrupted before commit.
- *   CHK — install is committed; Dell's binary writes "#CHK#<v>#" once
- *         the post-install reload verifies. This is the steady state
- *         a healthy monitor reports.
- *   UNKNOWN — the reply parsed but didn't carry a recognized prefix.
+ * The reply carries a 3-letter prefix and a version field. Decomp
+ * (firmware-updater.c around offset 0x317600 + 360764) shows Dell's
+ * binary calls this the "IspTag" command and writes "#ISP#<v>#" via
+ * the same selector elsewhere — but that write does NOT appear in our
+ * captured clean install (pcap starts before any IO and contains zero
+ * VCP 0xAD writes), so we don't actually know what triggers the ISP →
+ * CHK transition or what the prefix means operationally. What we DO
+ * know empirically: the chip persistently reports the
+ * last-installed-package version in the version field, regardless of
+ * which prefix it's wearing. Treat the version as authoritative; log
+ * the prefix for diagnostics; don't gate behavior on it until we
+ * understand its semantics.
  */
 typedef enum {
 	FU_DELL_MONITOR_RT_ISPTAG_UNKNOWN,
@@ -586,35 +590,25 @@ fu_dell_monitor_rt_isptag_state_str(FuDellMonitorRtIspTagState s)
 {
 	switch (s) {
 	case FU_DELL_MONITOR_RT_ISPTAG_ISP:
-		return "ISP (install in progress)";
+		return "ISP";
 	case FU_DELL_MONITOR_RT_ISPTAG_CHK:
-		return "CHK (committed)";
+		return "CHK";
 	default:
 		return "UNKNOWN";
 	}
 }
 
 /*
- * Read the IspTag state register from the chip via DDC/CI VCP 0xAD.
+ * Read the IspTag register from the chip via DDC/CI VCP 0xAD.
  *
- * Decomp evidence (firmware-updater.c around offset 0x317600 +
- * 360764) shows Dell's binary calls this register the "IspTag" — it's
- * a chip-side state field, not a firmware version. Dell *writes* it
- * during install ("#ISP#<package>#") to record install-in-progress,
- * then *rewrites* it after the post-install reload commits
- * ("#CHK#<package>#"). Reading it back tells us:
- *
- *   - the version of the last package the chip has been told about
- *   - whether that install committed (CHK) or was interrupted (ISP)
- *
- * The reply embeds the package version between '#' delimiters with the
- * 3-letter state prefix:
+ * The reply embeds the installed-package version between '#'
+ * delimiters with a 3-letter prefix:
  *
  *   request:  51 84 c0 99 ad 18 57    (cmd bytes, XOR-checksum)
  *   response: 51 9a c1 99 23 49 53 50 23 4d 33 54 31 30 35 23 …
  *                                  ↑  ↑  …  …  …  …  …  …  ↑
  *                            '#' 'I' 'S' 'P' '#' 'M' 3  T  '#'
- *                                    └ state ┘   └─ version ─┘
+ *                                    └ prefix ┘  └─ version ─┘
  *
  * Note: the response opcode is 0xC0 here, not 0xC1 like the simpler
  * VCP 0xCC reply — the existing parsers used to require 0xC1 strictly,
@@ -836,6 +830,96 @@ fu_dell_monitor_rt_device_read_panel_id(FuDellMonitorRtDevice *self,
 	}
 }
 
+/*
+ * verify_baseline — pre-flash sanity pass that runs before any device IO
+ * that mutates state.
+ *
+ * Two checks:
+ *
+ *   1. Read IspTag for diagnostics. Log the prefix (`ISP#` or `CHK#`)
+ *      and the chip's currently-installed package version. We do NOT
+ *      gate on the prefix — Dell's binary doesn't either (decomp walk
+ *      in PLUGIN_NOTES "Does Dell branch on the prefix?"). Both states
+ *      flash successfully in our captured fixture.
+ *
+ *   2. Read panel id (VCP 0xEE). Walk the .upg components: any with
+ *      `panel_bound: TRUE` MUST have `panel_id` matching the chip's
+ *      reported value. A mismatch means this .upg is for a different
+ *      panel SKU; flashing it would brick the monitor. Fail hard.
+ *
+ * We deliberately do NOT short-circuit on "version already matches" —
+ * fwupd's engine already filters that case at a higher level (via the
+ * device version vs. release version comparison, controlled by the
+ * `--allow-reinstall` CLI flag). Duplicating that check here would
+ * just complicate emulation testing without adding safety.
+ *
+ * Returns TRUE on success (proceed with install). Returns FALSE on
+ * panel mismatch, missing metadata, or read failure.
+ */
+static gboolean
+fu_dell_monitor_rt_device_verify_baseline(FuDellMonitorRtDevice *self,
+					  FuDellMonitorRtFirmware *fw_container,
+					  GError **error)
+{
+	FuDellMonitorRtIspTag tag = {0};
+	g_autofree gchar *panel_id = NULL;
+	GPtrArray *components;
+
+	/* 1. IspTag read — diagnostic only. */
+	if (!fu_dell_monitor_rt_device_read_isptag(self, &tag, error)) {
+		g_prefix_error(error, "verify_baseline: IspTag read failed: ");
+		return FALSE;
+	}
+	g_info("dell-monitor-rt: verify_baseline — chip IspTag prefix=%s "
+	       "version=%s",
+	       fu_dell_monitor_rt_isptag_state_str(tag.state),
+	       tag.version);
+	g_free(tag.version);
+
+	/* 2. Panel binding check. */
+	if (!fu_dell_monitor_rt_device_read_panel_id(self, &panel_id, error)) {
+		g_prefix_error(error, "verify_baseline: panel-id read failed: ");
+		return FALSE;
+	}
+	g_info("dell-monitor-rt: verify_baseline — chip panel id=%s", panel_id);
+
+	components = fu_firmware_get_images(FU_FIRMWARE(fw_container));
+	for (guint i = 0; i < components->len; i++) {
+		FuDellMonitorRtFirmwareComponent *component =
+		    FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT(
+			g_ptr_array_index(components, i));
+		const gchar *component_panel_id;
+
+		if (!fu_dell_monitor_rt_firmware_component_get_panel_bound(component))
+			continue;
+		component_panel_id =
+		    fu_dell_monitor_rt_firmware_component_get_panel_id(component);
+		if (component_panel_id == NULL) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "verify_baseline: panel-bound component '%s' "
+				    "has no panel_id metadata",
+				    fu_firmware_get_id(FU_FIRMWARE(component)));
+			return FALSE;
+		}
+		if (g_strcmp0(panel_id, component_panel_id) != 0) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_SUPPORTED,
+				    "verify_baseline: this .upg targets panel '%s' "
+				    "but the connected monitor reports panel '%s'. "
+				    "Refusing to flash panel-bound firmware to a "
+				    "different panel — that would brick it.",
+				    component_panel_id,
+				    panel_id);
+			return FALSE;
+		}
+	}
+
+	return TRUE;
+}
+
 static gboolean
 fu_dell_monitor_rt_device_probe(FuDevice *device, GError **error)
 {
@@ -986,11 +1070,9 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 			fu_device_set_version(device, "0.0.0-no-isptag");
 			return TRUE;
 		}
-		if (tag.state == FU_DELL_MONITOR_RT_ISPTAG_ISP) {
-			g_warning("dell-monitor-rt: IspTag state is ISP — previous "
-				  "install may have been interrupted; version=%s",
-				  tag.version);
-		}
+		g_debug("dell-monitor-rt: IspTag prefix=%s version=%s",
+			fu_dell_monitor_rt_isptag_state_str(tag.state),
+			tag.version);
 		fu_device_set_version(device, tag.version);
 		g_free(tag.version);
 	}
@@ -1706,6 +1788,19 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 								: "<missing>");
 			return FALSE;
 		}
+	}
+
+	/* Baseline verify — read IspTag + panel_id, log diagnostics, fail
+	 * hard on panel mismatch. Any subsequent IO depends on this check
+	 * passing. The version-match short-circuit happens at fwupd's
+	 * higher-level engine, not here. */
+	{
+		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
+
+		if (!fu_dell_monitor_rt_device_verify_baseline(self,
+							       fw_container,
+							       error))
+			return FALSE;
 	}
 
 	/* Track which (target, proto) pairs have been armed. Keys are

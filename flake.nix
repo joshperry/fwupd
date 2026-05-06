@@ -161,14 +161,15 @@
           fi
 
           # Run the emulator. --allow-older lets us replay against a cab
-          # that targets the pre-update version; otherwise fwupd refuses
-          # because the fixture's emulated device starts at the post-
-          # update version it was captured at.
+          # that targets the pre-update version; --allow-reinstall lets
+          # us replay even when the fixture's emulated device starts at
+          # the same version the cab carries.
           echo "running emulation-load against $fixture"
           exec "$MESON_BUILD_DIR/src/fwupdtool" emulation-load \
             "$fixture" "$cab" \
             --plugins dell_monitor_rt \
             --allow-older \
+            --allow-reinstall \
             "$@"
         '';
       in
