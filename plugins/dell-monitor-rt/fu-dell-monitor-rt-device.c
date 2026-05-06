@@ -559,81 +559,97 @@ fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
 }
 
 /*
- * Read the user-facing package version (the "M3T105"-style string Dell
- * shows in its GUI) from the FL5500 scaler via DDC/CI tunnel.
+ * IspTag state register: the chip's last-installed-package marker.
  *
- * The chip exposes several VCP queries via the same 0xC0/0x99 vendor-
- * command pair, each selecting a different version field:
+ *   ISP — install is in progress; Dell's binary writes "#ISP#<v>#" at
+ *         the start of an install to record "package <v> is currently
+ *         flashing." Reading this state on a fresh boot means the
+ *         previous install was interrupted before commit.
+ *   CHK — install is committed; Dell's binary writes "#CHK#<v>#" once
+ *         the post-install reload verifies. This is the steady state
+ *         a healthy monitor reports.
+ *   UNKNOWN — the reply parsed but didn't carry a recognized prefix.
+ */
+typedef enum {
+	FU_DELL_MONITOR_RT_ISPTAG_UNKNOWN,
+	FU_DELL_MONITOR_RT_ISPTAG_ISP,
+	FU_DELL_MONITOR_RT_ISPTAG_CHK,
+} FuDellMonitorRtIspTagState;
+
+typedef struct {
+	FuDellMonitorRtIspTagState state;
+	gchar *version; /* heap-owned; caller frees */
+} FuDellMonitorRtIspTag;
+
+static const gchar *
+fu_dell_monitor_rt_isptag_state_str(FuDellMonitorRtIspTagState s)
+{
+	switch (s) {
+	case FU_DELL_MONITOR_RT_ISPTAG_ISP:
+		return "ISP (install in progress)";
+	case FU_DELL_MONITOR_RT_ISPTAG_CHK:
+		return "CHK (committed)";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+/*
+ * Read the IspTag state register from the chip via DDC/CI VCP 0xAD.
  *
- *   51 84 c0 99 cc 20 0e   → "753.0AK01.0007"   (scaler component ID)
- *   51 84 c0 99 ad 18 57   → "ISP#M3T105#"      (user-facing package ←)
- *   51 84 c0 99 ee 20 2c   → (other sub-version)
- *   51 84 c0 99 aa 14 5c   → (other sub-version)
- *   …
+ * Decomp evidence (firmware-updater.c around offset 0x317600 +
+ * 360764) shows Dell's binary calls this register the "IspTag" — it's
+ * a chip-side state field, not a firmware version. Dell *writes* it
+ * during install ("#ISP#<package>#") to record install-in-progress,
+ * then *rewrites* it after the post-install reload commits
+ * ("#CHK#<package>#"). Reading it back tells us:
  *
- * We send the 0xAD selector — the response embeds the M3T105 between
- * '#' delimiters. After the post-update reload the same query returns
- * "CHK#M3T105#" instead of "ISP#M3T105#" (a different prefix marking
- * "the chip has confirmed the new firmware"); we strip either prefix
- * and surface the inner version unchanged.
+ *   - the version of the last package the chip has been told about
+ *   - whether that install committed (CHK) or was interrupted (ISP)
  *
- * Verified against captures/u4025qw-update-recap-20260502-185321.pcapng:
- * Dell's binary issues this exact 51 84 c0 99 ad 18 57 frame and reads
- * back 51 99 c0 55 ad 23 49 53 50 23 4d 33 54 31 30 35 23 …
- * (ASCII "…ISP#M3T105#…").
+ * The reply embeds the package version between '#' delimiters with the
+ * 3-letter state prefix:
  *
- * Note: the response opcode is 0xC0 here, not 0xC1 as for the 0xCC
- * selector — the existing parser's strict 0xC1 check would reject this
- * reply, so we accept both response opcodes.
+ *   request:  51 84 c0 99 ad 18 57    (cmd bytes, XOR-checksum)
+ *   response: 51 9a c1 99 23 49 53 50 23 4d 33 54 31 30 35 23 …
+ *                                  ↑  ↑  …  …  …  …  …  …  ↑
+ *                            '#' 'I' 'S' 'P' '#' 'M' 3  T  '#'
+ *                                    └ state ┘   └─ version ─┘
+ *
+ * Note: the response opcode is 0xC0 here, not 0xC1 like the simpler
+ * VCP 0xCC reply — the existing parsers used to require 0xC1 strictly,
+ * so we accept both.
+ *
+ * Verified against captures/u4025qw-update-recap-20260502-185321.pcapng.
  */
 static gboolean
-fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
-					      gchar **version_out,
-					      GError **error)
+fu_dell_monitor_rt_device_read_isptag(FuDellMonitorRtDevice *self,
+				      FuDellMonitorRtIspTag *tag_out,
+				      GError **error)
 {
-	/* Wire layout (DDC/CI):
-	 *   51 84 c0 99 ad 18 57
-	 *   │  │  └─────┬────┘ │
-	 *   │  │       cmd     XOR-checksum over 0x6E (dest) || all preceding
-	 *   │  length: 0x80 | (number of cmd bytes = 4)
-	 *   src addr (host = 0x51)
-	 *
-	 * Frame 188 of captures/u4025qw-update-recap-20260502-185321.pcapng. */
 	const guint8 i2c_request[7] = {
 	    0x51, 0x84, 0xc0, 0x99, 0xad, 0x18, 0x57,
 	};
 	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
 	guint8 hub_key[8];
 
-	/* Derive the cal_auth key from the per-product seed buffer
-	 * (cert.dat shipped with Dell's .deb). For the U4025QW this
-	 * yields 4F DC C1 10 11 6D 76 02. */
+	g_return_val_if_fail(tag_out != NULL, FALSE);
+	tag_out->state = FU_DELL_MONITOR_RT_ISPTAG_UNKNOWN;
+	tag_out->version = NULL;
+
+	/* Derive the cal_auth key from the per-product seed buffer. */
 	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
 				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
 				      hub_key);
-
-	/* The I²C tunnel is gated by a per-cycle auth handshake; the device
-	 * STALLs subsequent 0xC6/0xD6 traffic if we skip it. Per the pcap
-	 * the handshake must precede the WRITE in each cycle. */
 	if (!fu_dell_monitor_rt_device_handshake(self, hub_key, error))
 		return FALSE;
-
 	if (!fu_dell_monitor_rt_device_i2c_write(self,
 						 DELL_MONITOR_RT_I2C_TARGET_DDCCI,
 						 i2c_request,
 						 sizeof(i2c_request),
 						 error))
 		return FALSE;
-
-	/* DDC/CI replies are slow — the FL5500 needs time to compose the
-	 * response and stage it for retrieval over the I²C tunnel. In the
-	 * pcap, Dell's binary waits ~280 frames (≈3 seconds at the captured
-	 * rate) between the WRITE and the READ. Match that with a generous
-	 * single sleep here. */
-	g_usleep(50 * 1000); /* 50 ms */
-
-	/* Pull whatever bytes the device buffered. Dell's binary uses
-	 * length 0x40 (=64) as the "give me everything" READ. */
+	g_usleep(50 * 1000);
 	if (!fu_dell_monitor_rt_device_i2c_read(self,
 						DELL_MONITOR_RT_I2C_TARGET_DDCCI,
 						0x40,
@@ -646,6 +662,8 @@ fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 		const guint8 *wire = &response[1]; /* skip report-ID prefix */
 		gsize len;
 		g_autoptr(GString) ascii = NULL;
+		const gchar *isp_prefix;
+		const gchar *chk_prefix;
 		const gchar *prefix;
 
 		if (wire[0] != 0x51 || (wire[1] & 0x80) == 0 ||
@@ -653,57 +671,62 @@ fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 			g_set_error(error,
 				    FWUPD_ERROR,
 				    FWUPD_ERROR_READ,
-				    "scaler-version DDC/CI reply malformed: "
+				    "IspTag DDC/CI reply malformed: "
 				    "wire[0..3]=%02X %02X %02X %02X",
 				    wire[0], wire[1], wire[2], wire[3]);
 			return FALSE;
 		}
-
-		/* DDC/CI: byte 1 low 7 bits = number of payload bytes
-		 * (opcode + sub + data, *not* including checksum). Data
-		 * runs from byte 4 onward (after src/len/op/sub). */
 		len = (wire[1] & 0x7F);
 		if (len < 2 || len >= 60) {
 			g_set_error(error,
 				    FWUPD_ERROR,
 				    FWUPD_ERROR_READ,
-				    "scaler-version DDC/CI reply has bad length 0x%02x",
+				    "IspTag DDC/CI reply has bad length 0x%02x",
 				    (unsigned)wire[1]);
 			return FALSE;
 		}
 
-		/* Build a printable-ASCII view of the data area, including
-		 * '#' delimiters. The response has a small fixed header
-		 * (e.g. 55 ad 23) followed by '#'-delimited fields like
-		 *   ISP#M3T105#
-		 *   CHK#M3T105#   (post-update variant)
-		 * We extract the version field by finding the prefix tag
-		 * and taking everything up to the next '#'. */
 		ascii = g_string_new(NULL);
 		for (gsize i = 4; i < (gsize)(len + 2) && i < 60; i++) {
 			if (wire[i] >= 0x20 && wire[i] < 0x7f)
 				g_string_append_c(ascii, (gchar)wire[i]);
 		}
 
-		prefix = strstr(ascii->str, "ISP#");
-		if (prefix == NULL)
-			prefix = strstr(ascii->str, "CHK#");
-		if (prefix != NULL) {
-			const gchar *value = prefix + 4;
-			const gchar *end = strchr(value, '#');
-			if (end != NULL && end > value) {
-				*version_out = g_strndup(value, end - value);
-				return TRUE;
-			}
+		isp_prefix = strstr(ascii->str, "ISP#");
+		chk_prefix = strstr(ascii->str, "CHK#");
+		if (isp_prefix != NULL) {
+			tag_out->state = FU_DELL_MONITOR_RT_ISPTAG_ISP;
+			prefix = isp_prefix;
+		} else if (chk_prefix != NULL) {
+			tag_out->state = FU_DELL_MONITOR_RT_ISPTAG_CHK;
+			prefix = chk_prefix;
+		} else {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_READ,
+				    "IspTag reply contained neither ISP#…# nor "
+				    "CHK#…# field; ascii=%s",
+				    ascii->str);
+			return FALSE;
 		}
 
-		g_set_error(error,
-			    FWUPD_ERROR,
-			    FWUPD_ERROR_READ,
-			    "scaler-version reply did not contain ISP#…# or CHK#…# "
-			    "version field; ascii=%s",
-			    ascii->str);
-		return FALSE;
+		{
+			const gchar *value = prefix + 4;
+			const gchar *end = strchr(value, '#');
+			if (end == NULL || end == value) {
+				g_set_error(error,
+					    FWUPD_ERROR,
+					    FWUPD_ERROR_READ,
+					    "IspTag %s prefix has no terminating '#'; "
+					    "ascii=%s",
+					    fu_dell_monitor_rt_isptag_state_str(
+						tag_out->state),
+					    ascii->str);
+				return FALSE;
+			}
+			tag_out->version = g_strndup(value, end - value);
+		}
+		return TRUE;
 	}
 }
 
@@ -954,16 +977,22 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 	 * i2c_read) keeps the event cursor in step with the fixture. */
 	g_clear_error(&error_local);
 	{
-		g_autofree gchar *scaler_ver = NULL;
-		if (!fu_dell_monitor_rt_device_read_scaler_version(self,
-								   &scaler_ver,
-								   &error_local)) {
-			g_warning("dell-monitor-rt: scaler version read failed: %s",
+		FuDellMonitorRtIspTag tag = {0};
+		if (!fu_dell_monitor_rt_device_read_isptag(self,
+							   &tag,
+							   &error_local)) {
+			g_warning("dell-monitor-rt: IspTag read failed: %s",
 				  error_local->message);
-			fu_device_set_version(device, "0.0.0-no-scaler-version");
+			fu_device_set_version(device, "0.0.0-no-isptag");
 			return TRUE;
 		}
-		fu_device_set_version(device, scaler_ver);
+		if (tag.state == FU_DELL_MONITOR_RT_ISPTAG_ISP) {
+			g_warning("dell-monitor-rt: IspTag state is ISP — previous "
+				  "install may have been interrupted; version=%s",
+				  tag.version);
+		}
+		fu_device_set_version(device, tag.version);
+		g_free(tag.version);
 	}
 	return TRUE;
 }
