@@ -707,6 +707,112 @@ fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 	}
 }
 
+/*
+ * Read the panel id from the FL5500 scaler via DDC/CI VCP 0xEE.
+ *
+ * Each panel SKU gets its own scaler firmware build, so the scaler's
+ * firmware ID uniquely names the panel. The .upg's panel-binding
+ * metadata uses this exact string as the key for panel-bound
+ * components (DISPLAY in our test bundle): a component with
+ * panel_bound: true and panel_id: 753.0AK01.0007 means "this entry
+ * is the panel-specific firmware for monitors whose scaler reports
+ * 753.0AK01.0007". A connected monitor whose scaler reports a
+ * different string isn't supported by this .upg — flashing
+ * panel-bound firmware to the wrong panel would brick it.
+ *
+ * Wire layout (DDC/CI):
+ *   51 84 c0 99 ee 20 2c
+ *   │  │  └─────┬────┘ │
+ *   │  │       cmd     XOR-checksum over 0x6E (dest) || all preceding
+ *   │  length: 0x80 | (number of cmd bytes = 4)
+ *   src addr (host = 0x51)
+ *
+ * Reply (16 ASCII bytes between header and checksum, no '#'
+ * delimiters):
+ *   51 90 c1 99 37 35 33 2e 30 41 4b 30 31 2e 30 30 30 37 c4
+ *                 7  5  3  .  0  A  K  0  1  .  0  0  0  7
+ *
+ * Verified against captures/u4025qw-update-recap-20260502-185321.pcapng.
+ */
+static gboolean
+fu_dell_monitor_rt_device_read_panel_id(FuDellMonitorRtDevice *self,
+					gchar **panel_id_out,
+					GError **error)
+{
+	const guint8 i2c_request[7] = {
+	    0x51, 0x84, 0xc0, 0x99, 0xee, 0x20, 0x2c,
+	};
+	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	guint8 hub_key[8];
+
+	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+				      hub_key);
+	if (!fu_dell_monitor_rt_device_handshake(self, hub_key, error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_device_i2c_write(self,
+						 DELL_MONITOR_RT_I2C_TARGET_DDCCI,
+						 i2c_request,
+						 sizeof(i2c_request),
+						 error))
+		return FALSE;
+	g_usleep(50 * 1000);
+	if (!fu_dell_monitor_rt_device_i2c_read(self,
+						DELL_MONITOR_RT_I2C_TARGET_DDCCI,
+						0x40,
+						response,
+						sizeof(response),
+						error))
+		return FALSE;
+
+	{
+		const guint8 *wire = &response[1]; /* skip report-ID prefix */
+		gsize len;
+		g_autoptr(GString) ascii = NULL;
+
+		if (wire[0] != 0x51 || (wire[1] & 0x80) == 0 ||
+		    (wire[2] != 0xC0 && wire[2] != 0xC1)) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_READ,
+				    "panel-id DDC/CI reply malformed: "
+				    "wire[0..3]=%02X %02X %02X %02X",
+				    wire[0], wire[1], wire[2], wire[3]);
+			return FALSE;
+		}
+		len = (wire[1] & 0x7F);
+		if (len < 2 || len >= 60) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_READ,
+				    "panel-id DDC/CI reply has bad length 0x%02x",
+				    (unsigned)wire[1]);
+			return FALSE;
+		}
+
+		/* Data area starts at byte 4 (after src/len/op/sub) and runs
+		 * for (len - 2) bytes. The reply has no '#' delimiters — the
+		 * panel id is the contiguous printable-ASCII run. */
+		ascii = g_string_new(NULL);
+		for (gsize i = 4; i < (gsize)(len + 2) && i < 60; i++) {
+			if (wire[i] >= 0x20 && wire[i] < 0x7f)
+				g_string_append_c(ascii, (gchar)wire[i]);
+			else if (ascii->len > 0)
+				break; /* end of ASCII run */
+		}
+
+		if (ascii->len == 0) {
+			g_set_error_literal(error,
+					    FWUPD_ERROR,
+					    FWUPD_ERROR_READ,
+					    "panel-id reply contained no printable ASCII");
+			return FALSE;
+		}
+		*panel_id_out = g_strdup(ascii->str);
+		return TRUE;
+	}
+}
+
 static gboolean
 fu_dell_monitor_rt_device_probe(FuDevice *device, GError **error)
 {
