@@ -1116,12 +1116,47 @@ typedef enum {
 	FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE,
 } FuDellMonitorRtRouteKind;
 
-typedef struct {
+/*
+ * Per-chip-class protocol handler. Modeled after libhub.so's class
+ * hierarchy (Rts5409s_ISP / Rts5418e_ISP / Rts5409s_IIC_ISP /
+ * PS5512_ISP / Mchp58xx_72xx_ISP / FL5500_IIC_ISP / …) — each chip
+ * family Dell talks to has its own set of pre-stage and stage
+ * primitives. We mirror the dispatch with function pointers keyed by
+ * the .upg's chip_guid_alt field, which encodes the *target* chip
+ * class (vs chip_guid which encodes the *transport* chip).
+ *
+ *   arm_target  Called once per (target_device, this proto) before
+ *               the first stage_blob lands on `target`. Issues any
+ *               chip-mode prep — for the RTS540x family that's the
+ *               enable_vdcmd sub=3 + 0xE8 sequence Dell does
+ *               immediately before its first c8 frame on each chip;
+ *               for the downstream-MCU class it's a no-op.
+ *
+ *   stage_blob  Stage one component's bytes onto the target. The
+ *               route carries the i2c slave (for I2C_TUNNEL kinds)
+ *               or the chip-internal slot index (DIRECT_STAGE).
+ */
+typedef struct _FuDellMonitorRtChipProto FuDellMonitorRtChipProto;
+typedef struct _FuDellMonitorRtRoute FuDellMonitorRtRoute;
+
+struct _FuDellMonitorRtChipProto {
+	const gchar *name;
+	const gchar *chip_guid_alt;
+	gboolean (*arm_target)(FuDellMonitorRtDevice *target, GError **error);
+	gboolean (*stage_blob)(FuDellMonitorRtDevice *target,
+			       const FuDellMonitorRtRoute *route,
+			       GBytes *blob,
+			       GError **error);
+};
+
+struct _FuDellMonitorRtRoute {
 	FuDellMonitorRtRouteKind kind;
 	FuDellMonitorRtDevice *target;
 	guint16 usb_pid;
 	guint8 i2c_target;
-} FuDellMonitorRtRoute;
+	const gchar *chip_guid_alt;	   /* metadata, kept for diagnostics */
+	const FuDellMonitorRtChipProto *proto; /* NULL if class is unhandled */
+};
 
 /* Downstream-MCU i2c slaves we've decoded sit at 0xD0+ on the primary's
  * internal i2c bus. Smaller values like PDC's 0x21 are some other kind
@@ -1132,6 +1167,155 @@ typedef struct {
  * HUB=1, HUB4=2; 0 and 0x10..0xCF are something else. */
 #define DELL_MONITOR_RT_DIRECT_INDEX_MIN 0x01
 #define DELL_MONITOR_RT_DIRECT_INDEX_MAX 0x0F
+
+/* ----- chip-protocol handlers --------------------------------------
+ *
+ * Each handler implements arm_target + stage_blob for one chip class.
+ * Modeled after libhub.so's per-chip ISP classes (Rts5409s_ISP /
+ * Rts5418e_ISP / Rts5409s_IIC_ISP / …) — they share a virtual
+ * interface; we share a function-pointer struct.
+ */
+
+/*
+ * RTS5409s/RTS5418E hub MCU class (chip_guid_alt 55afe793-…).
+ *
+ * arm_target sequence — observed exactly twice in the recap pcap, once
+ * per chip, immediately before the first c8 frame on each:
+ *
+ *   40 02 03 00 …    enable_vdcmd sub=0x03  (mode-switch into c8-stage
+ *                                             allowed mode; setup()
+ *                                             only does sub=0x01)
+ *   40 e8 00 01 …    0xE8 sub=0x00 arg=0x01 (arm c8-staging engine —
+ *                                             undocumented opcode, no
+ *                                             other occurrence in the
+ *                                             880k-frame trace)
+ *
+ * Without this prep on real hardware the chip's c8 handler is likely
+ * to either reject the staging frames or stage them somewhere we
+ * don't expect. Under emulation the leapfrog matcher hides the
+ * problem because the requested c8 frames just match later positions
+ * in the captured stream — but the wire bytes are missing.
+ */
+static gboolean
+fu_dell_monitor_rt_proto_rts540x_arm(FuDellMonitorRtDevice *target, GError **error)
+{
+	const guint8 vendor_sig[2] = {DELL_MONITOR_RT_VENDOR_SIG_LO,
+				      DELL_MONITOR_RT_VENDOR_SIG_HI};
+	/* enable_vdcmd carries the RealTek vendor ID in its payload — the
+	 * chip uses it as a "you may have noticed I'm a vendor command"
+	 * sanity check. sub=3 unlocks c8 staging mode (vs sub=1 which is
+	 * basic vendor-cmd enable). */
+	if (!fu_dell_monitor_rt_device_vcmd(target,
+					    DELL_MONITOR_RT_DIR_WRITE,
+					    DELL_MONITOR_RT_OPCODE_ENABLE_VDCMD,
+					    0x03,
+					    0x00,
+					    vendor_sig,
+					    sizeof(vendor_sig),
+					    error)) {
+		g_prefix_error(error, "rts540x arm enable_vdcmd sub=3: ");
+		return FALSE;
+	}
+	/* 0xE8 sub=0 arg=1 — undocumented opcode that arms the c8-staging
+	 * engine. Only two occurrences in the entire 880k-frame trace,
+	 * one per chip, immediately before its first c8 frame. */
+	if (!fu_dell_monitor_rt_device_vcmd(target,
+					    DELL_MONITOR_RT_DIR_WRITE,
+					    0xE8,
+					    0x00,
+					    0x01,
+					    NULL,
+					    0,
+					    error)) {
+		g_prefix_error(error, "rts540x arm 0xE8: ");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static gboolean
+fu_dell_monitor_rt_proto_rts540x_stage(FuDellMonitorRtDevice *target,
+				       const FuDellMonitorRtRoute *route,
+				       GBytes *blob,
+				       GError **error)
+{
+	(void)route; /* DIRECT_STAGE — the route's i2c_target is unused */
+	return fu_dell_monitor_rt_device_stage_isp_firmware(target, blob, NULL, error);
+}
+
+/*
+ * Downstream-MCU class (chip_guid_alt 5f3ba3d6-…).
+ *
+ * The chip we're talking *to* is the primary (i2c bus is on it); the
+ * actual MCU receiving these bytes isn't a USB device. arm_target is
+ * a no-op because the primary is already in vendor-cmd mode from
+ * setup(); the per-blob cal_auth happens in stage_blob since the auth
+ * ticket is per-blob in Dell's binary too.
+ *
+ * Modeled after libhub.so::Rts5409s_IIC_ISP — same chip class as the
+ * RTS540x but speaking the IIC variant of the ISP.
+ */
+static gboolean
+fu_dell_monitor_rt_proto_dsmcu_arm(FuDellMonitorRtDevice *target, GError **error)
+{
+	(void)target;
+	(void)error;
+	return TRUE;
+}
+
+static gboolean
+fu_dell_monitor_rt_proto_dsmcu_stage(FuDellMonitorRtDevice *target,
+				     const FuDellMonitorRtRoute *route,
+				     GBytes *blob,
+				     GError **error)
+{
+	guint8 hub_key[8];
+
+	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+				      hub_key);
+	if (!fu_dell_monitor_rt_device_handshake(target, hub_key, error))
+		return FALSE;
+	return fu_dell_monitor_rt_device_stage_downstream_mcu(target,
+							      route->i2c_target,
+							      blob,
+							      NULL,
+							      error);
+}
+
+/*
+ * Chip-protocol registry. Adding a new chip class for a future Dell
+ * monitor (Parade scaler, Microchip dock controller, …) is a matter
+ * of decoding its protocol from libhub.so's matching ISP class and
+ * appending an entry here.
+ */
+static const FuDellMonitorRtChipProto FU_DELL_MONITOR_RT_CHIP_PROTOS[] = {
+    {
+	.name = "RTS5409s/RTS5418E hub MCU (c8 RAM stage)",
+	.chip_guid_alt = "55afe793-98e8-470e-ad09-993be2b3b016",
+	.arm_target = fu_dell_monitor_rt_proto_rts540x_arm,
+	.stage_blob = fu_dell_monitor_rt_proto_rts540x_stage,
+    },
+    {
+	.name = "Downstream MCU (i2c-tunnel RAM loader)",
+	.chip_guid_alt = "5f3ba3d6-a0bd-4270-9938-814a45d5c824",
+	.arm_target = fu_dell_monitor_rt_proto_dsmcu_arm,
+	.stage_blob = fu_dell_monitor_rt_proto_dsmcu_stage,
+    },
+};
+
+static const FuDellMonitorRtChipProto *
+fu_dell_monitor_rt_proto_lookup(const gchar *chip_guid_alt)
+{
+	if (chip_guid_alt == NULL)
+		return NULL;
+	for (gsize i = 0; i < G_N_ELEMENTS(FU_DELL_MONITOR_RT_CHIP_PROTOS); i++) {
+		if (g_strcmp0(FU_DELL_MONITOR_RT_CHIP_PROTOS[i].chip_guid_alt,
+			      chip_guid_alt) == 0)
+			return &FU_DELL_MONITOR_RT_CHIP_PROTOS[i];
+	}
+	return NULL;
+}
 
 static FuDellMonitorRtDevice *
 fu_dell_monitor_rt_device_find_target_by_pid(FuDellMonitorRtDevice *self, guint16 pid)
@@ -1157,6 +1341,7 @@ fu_dell_monitor_rt_route_for_component(FuDellMonitorRtDevice *self,
 {
 	const gchar *usb_pid_str;
 	const gchar *i2c_str;
+	const gchar *chip_guid_alt;
 	guint64 usb_pid_val = 0;
 	guint64 i2c_val = 0;
 
@@ -1165,6 +1350,11 @@ fu_dell_monitor_rt_route_for_component(FuDellMonitorRtDevice *self,
 	    component, FU_DELL_MONITOR_RT_FIRMWARE_FIELD_USB_PID);
 	i2c_str = fu_dell_monitor_rt_firmware_component_get_field_string(
 	    component, FU_DELL_MONITOR_RT_FIRMWARE_FIELD_I2C_OR_INDEX);
+	chip_guid_alt = fu_dell_monitor_rt_firmware_component_get_field_string(
+	    component, FU_DELL_MONITOR_RT_FIRMWARE_FIELD_CHIP_GUID_ALT);
+	route_out->chip_guid_alt = chip_guid_alt;
+	route_out->proto = fu_dell_monitor_rt_proto_lookup(chip_guid_alt);
+
 	if (usb_pid_str == NULL || i2c_str == NULL)
 		return FALSE;
 	if (!fu_strtoull(usb_pid_str, &usb_pid_val, 0, 0xFFFF, FU_INTEGER_BASE_AUTO, NULL))
@@ -1203,29 +1393,29 @@ fu_dell_monitor_rt_route_for_component(FuDellMonitorRtDevice *self,
  * legitimately span multiple components and the caller has the
  * better view of when to refresh.
  */
+/*
+ * Stage one component along its computed route, dispatching via the
+ * route's chip-protocol handler. The handler covers any chip-mode
+ * prep + the per-blob wire sequence; the caller is responsible for
+ * having already called `arm_target` once per (target, proto). A
+ * NULL route->proto means we ran without pre-validation and is a
+ * programming error — the validation pass at the top of write_firmware
+ * is what should have failed first.
+ */
 static gboolean
 fu_dell_monitor_rt_device_stage_along_route(const FuDellMonitorRtRoute *route,
 					    GBytes *blob,
 					    GError **error)
 {
-	if (route->kind == FU_DELL_MONITOR_RT_ROUTE_I2C_TUNNEL) {
-		return fu_dell_monitor_rt_device_stage_downstream_mcu(route->target,
-								      route->i2c_target,
-								      blob,
-								      NULL,
-								      error);
+	if (route->proto == NULL) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INTERNAL,
+				    "stage_along_route called without a chip-protocol "
+				    "handler — pre-validation should have rejected this");
+		return FALSE;
 	}
-	if (route->kind == FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE) {
-		return fu_dell_monitor_rt_device_stage_isp_firmware(route->target,
-								    blob,
-								    NULL,
-								    error);
-	}
-	g_set_error_literal(error,
-			    FWUPD_ERROR,
-			    FWUPD_ERROR_NOT_SUPPORTED,
-			    "no route for component (post-bootloader payload?)");
-	return FALSE;
+	return route->proto->stage_blob(route->target, route, blob, error);
 }
 
 /*
@@ -1304,210 +1494,195 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		return FALSE;
 	}
 
+	/* Pre-validation — walk every component, classify, and bail
+	 * BEFORE any IO if any routable component's chip class is
+	 * unhandled. Components with route.kind == NONE (post-bootloader
+	 * scaler payloads etc.) skip the check; we don't write to them
+	 * anyway. The "fail hard before writes" property is the whole
+	 * point of this pass. */
 	{
 		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
-		guint8 hub_key[8];
-		gboolean did_handshake = FALSE;
-		gboolean any_tunnel = FALSE;
 
-		fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
-					      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
-					      hub_key);
 		components = fu_firmware_get_images(firmware);
-
-		/* Pass 1 — i2c-tunnel components. Run on the primary's i2c
-		 * bus, each preceded by a fresh cal_auth (matches Dell's
-		 * binary, which holds one auth ticket per blob). */
 		for (guint i = 0; i < components->len; i++) {
 			FuDellMonitorRtFirmwareComponent *component =
 			    FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT(
 				g_ptr_array_index(components, i));
 			FuDellMonitorRtRoute route = {0};
-			g_autoptr(GBytes) blob = NULL;
-			g_autoptr(GError) error_local = NULL;
 
 			if (!fu_dell_monitor_rt_route_for_component(self, component, &route))
 				continue;
-			if (route.kind != FU_DELL_MONITOR_RT_ROUTE_I2C_TUNNEL)
+			if (route.kind == FU_DELL_MONITOR_RT_ROUTE_NONE)
 				continue;
-			any_tunnel = TRUE;
-			blob = fu_firmware_get_bytes(FU_FIRMWARE(component), &error_local);
-			if (blob == NULL) {
-				g_prefix_error(&error_local,
-					       "i2c-tunnel stage of %s: ",
-					       fu_firmware_get_id(FU_FIRMWARE(component)));
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				return FALSE;
-			}
-			if (!fu_dell_monitor_rt_device_handshake(self, hub_key, &error_local)) {
-				g_prefix_error(&error_local,
-					       "cal_auth before %s: ",
-					       fu_firmware_get_id(FU_FIRMWARE(component)));
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				return FALSE;
-			}
-			did_handshake = TRUE;
-			if (!fu_dell_monitor_rt_device_stage_along_route(&route,
-									 blob,
-									 &error_local)) {
-				g_prefix_error(&error_local,
-					       "%s -> i2c 0x%02x: ",
-					       fu_firmware_get_id(FU_FIRMWARE(component)),
-					       (unsigned)route.i2c_target);
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				return FALSE;
-			}
-			g_info("dell-monitor-rt: %s staged via i2c-tunnel to 0x%02x (%" G_GSIZE_FORMAT
-			       " bytes)",
-			       fu_firmware_get_id(FU_FIRMWARE(component)),
-			       (unsigned)route.i2c_target,
-			       g_bytes_get_size(blob));
+			if (route.proto != NULL)
+				continue;
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_SUPPORTED,
+				    "dell-monitor-rt: refusing to install — component "
+				    "'%s' has chip_guid_alt=%s which has no registered "
+				    "protocol handler. We don't know how to safely talk "
+				    "to that chip class. Add a handler to "
+				    "FU_DELL_MONITOR_RT_CHIP_PROTOS[] or rebuild the "
+				    ".upg without that component.",
+				    fu_firmware_get_id(FU_FIRMWARE(component)),
+				    route.chip_guid_alt != NULL ? route.chip_guid_alt
+								: "<missing>");
+			return FALSE;
 		}
-		(void)any_tunnel;
-		(void)did_handshake;
 	}
 
-	/* Pass 2 — direct-stage components on each non-primary USB
-	 * device, followed by that device's bootloader-entry trigger.
-	 * Dell's trace fires the secondary's 0xE9 *before* the primary's,
-	 * so we drain non-primary devices first. */
+	/* Track which (target, proto) pairs have been armed. Keys are
+	 * "<device-id>|<proto-name>" strings. Hash table owns the keys. */
 	{
 		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
 		guint16 primary_pid = fu_device_get_pid(device);
-		GHashTable *triggered =
+		g_autoptr(GHashTable) armed =
+		    g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+		g_autoptr(GHashTable) triggered =
 		    g_hash_table_new(g_direct_hash, g_direct_equal);
 
-		components = fu_firmware_get_images(firmware);
-		for (guint i = 0; i < components->len; i++) {
-			FuDellMonitorRtFirmwareComponent *component =
-			    FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT(
-				g_ptr_array_index(components, i));
-			FuDellMonitorRtRoute route = {0};
-			g_autoptr(GBytes) blob = NULL;
-			g_autoptr(GError) error_local = NULL;
+		/* The three passes match Dell's observed order:
+		 *
+		 *   Pass 1 — every i2c-tunnel component. The proto's stage_blob
+		 *            does its own per-blob cal_auth.
+		 *   Pass 2 — every direct-stage component whose target is NOT
+		 *            the primary, followed by that target's 0xE9. Dell
+		 *            fires the secondary's 0xE9 before the primary's,
+		 *            so we drain non-primary devices first.
+		 *   Pass 3 — every direct-stage component whose target IS the
+		 *            primary, then the primary's 0xE9. After this pass
+		 *            the primary's firmware-mode hidraw fd becomes
+		 *            invalid; the post-bootloader flash phase runs
+		 *            against a freshly re-enumerated FuDevice and is
+		 *            not yet implemented.
+		 */
+		for (guint pass = 0; pass < 3; pass++) {
+			components = fu_firmware_get_images(firmware);
+			for (guint i = 0; i < components->len; i++) {
+				FuDellMonitorRtFirmwareComponent *component =
+				    FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT(
+					g_ptr_array_index(components, i));
+				FuDellMonitorRtRoute route = {0};
+				g_autoptr(GBytes) blob = NULL;
+				g_autoptr(GError) error_local = NULL;
+				g_autofree gchar *arm_key = NULL;
+				const gchar *id;
 
-			if (!fu_dell_monitor_rt_route_for_component(self, component, &route))
-				continue;
-			if (route.kind != FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE)
-				continue;
-			if (route.usb_pid == primary_pid)
-				continue; /* deferred to pass 3 */
-			if (route.target == NULL) {
-				g_warning("dell-monitor-rt: %s wants direct stage on "
-					  "pid 0x%04x but no such child is paired "
-					  "(expected under emulation; would be a hard "
-					  "FAIL on real hardware)",
-					  fu_firmware_get_id(FU_FIRMWARE(component)),
-					  (unsigned)route.usb_pid);
-				continue;
-			}
-			blob = fu_firmware_get_bytes(FU_FIRMWARE(component), &error_local);
-			if (blob == NULL) {
-				g_prefix_error(&error_local,
-					       "direct stage of %s: ",
-					       fu_firmware_get_id(FU_FIRMWARE(component)));
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				g_hash_table_unref(triggered);
-				return FALSE;
-			}
-			if (!fu_dell_monitor_rt_device_stage_along_route(&route,
-									 blob,
-									 &error_local)) {
-				g_prefix_error(&error_local,
-					       "%s -> pid 0x%04x: ",
-					       fu_firmware_get_id(FU_FIRMWARE(component)),
-					       (unsigned)route.usb_pid);
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				g_hash_table_unref(triggered);
-				return FALSE;
-			}
-			g_info("dell-monitor-rt: %s staged on pid 0x%04x (%" G_GSIZE_FORMAT
-			       " bytes)",
-			       fu_firmware_get_id(FU_FIRMWARE(component)),
-			       (unsigned)route.usb_pid,
-			       g_bytes_get_size(blob));
+				if (!fu_dell_monitor_rt_route_for_component(self, component,
+									    &route))
+					continue;
+				if (route.kind == FU_DELL_MONITOR_RT_ROUTE_NONE)
+					continue;
+				if (route.target == NULL) {
+					g_warning("dell-monitor-rt: %s wants chip class %s on "
+						  "pid 0x%04x but no such device is paired "
+						  "(expected under single-device emulation; "
+						  "would have failed pre-validation if "
+						  "real-hardware-targeting)",
+						  fu_firmware_get_id(FU_FIRMWARE(component)),
+						  route.chip_guid_alt,
+						  (unsigned)route.usb_pid);
+					continue;
+				}
 
-			if (!g_hash_table_contains(triggered, route.target)) {
-				if (!fu_dell_monitor_rt_device_enter_bootloader(route.target,
-										&error_local)) {
+				/* Pass-filter */
+				if (pass == 0 &&
+				    route.kind != FU_DELL_MONITOR_RT_ROUTE_I2C_TUNNEL)
+					continue;
+				if (pass == 1 &&
+				    !(route.kind == FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE &&
+				      route.usb_pid != primary_pid))
+					continue;
+				if (pass == 2 &&
+				    !(route.kind == FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE &&
+				      route.usb_pid == primary_pid))
+					continue;
+
+				blob = fu_firmware_get_bytes(FU_FIRMWARE(component),
+							     &error_local);
+				if (blob == NULL) {
 					g_prefix_error(&error_local,
-						       "bootloader-entry on pid 0x%04x: ",
-						       (unsigned)route.usb_pid);
+						       "fetching bytes for %s: ",
+						       fu_firmware_get_id(FU_FIRMWARE(component)));
 					g_propagate_error(error,
 							  g_steal_pointer(&error_local));
-					g_hash_table_unref(triggered);
 					return FALSE;
 				}
-				g_hash_table_add(triggered, route.target);
-				g_info("dell-monitor-rt: bootloader-entry trigger sent on "
-				       "pid 0x%04x",
-				       (unsigned)route.usb_pid);
+
+				/* Arm the (target, proto) pair once. */
+				id = fu_device_get_id(FU_DEVICE(route.target));
+				arm_key = g_strdup_printf("%s|%s",
+							  id != NULL ? id : "(no-id)",
+							  route.proto->name);
+				if (!g_hash_table_contains(armed, arm_key)) {
+					if (!route.proto->arm_target(route.target,
+								     &error_local)) {
+						g_prefix_error(&error_local,
+							       "arming %s for %s: ",
+							       id, route.proto->name);
+						g_propagate_error(error,
+								  g_steal_pointer(&error_local));
+						return FALSE;
+					}
+					g_hash_table_add(armed, g_steal_pointer(&arm_key));
+					g_info("dell-monitor-rt: armed %s with %s",
+					       id, route.proto->name);
+				}
+
+				if (!fu_dell_monitor_rt_device_stage_along_route(&route,
+										 blob,
+										 &error_local)) {
+					g_prefix_error(&error_local,
+						       "%s via %s: ",
+						       fu_firmware_get_id(FU_FIRMWARE(component)),
+						       route.proto->name);
+					g_propagate_error(error,
+							  g_steal_pointer(&error_local));
+					return FALSE;
+				}
+				if (route.kind == FU_DELL_MONITOR_RT_ROUTE_I2C_TUNNEL) {
+					g_info("dell-monitor-rt: %s staged via i2c-tunnel to 0x%02x "
+					       "(%" G_GSIZE_FORMAT " bytes)",
+					       fu_firmware_get_id(FU_FIRMWARE(component)),
+					       (unsigned)route.i2c_target,
+					       g_bytes_get_size(blob));
+				} else {
+					g_info("dell-monitor-rt: %s staged on pid 0x%04x (%" G_GSIZE_FORMAT
+					       " bytes)",
+					       fu_firmware_get_id(FU_FIRMWARE(component)),
+					       (unsigned)route.usb_pid,
+					       g_bytes_get_size(blob));
+				}
+
+				/* For non-tunnel passes, fire 0xE9 once per target
+				 * after that target's last component. We
+				 * approximate "last component" by triggering on
+				 * EVERY direct-stage component but tracking
+				 * triggered-targets — first stage marks it
+				 * triggered, subsequent stages skip the trigger.
+				 * (The order is: stage, trigger, stage-on-other-
+				 * device, trigger-on-other-device. Triggering
+				 * after the first stage matches Dell's order
+				 * since each device only has one direct-stage
+				 * component on this product.) */
+				if (route.kind == FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE &&
+				    !g_hash_table_contains(triggered, route.target)) {
+					if (!fu_dell_monitor_rt_device_enter_bootloader(
+						route.target, &error_local)) {
+						g_prefix_error(&error_local,
+							       "bootloader-entry on pid 0x%04x: ",
+							       (unsigned)route.usb_pid);
+						g_propagate_error(error,
+								  g_steal_pointer(&error_local));
+						return FALSE;
+					}
+					g_hash_table_add(triggered, route.target);
+					g_info("dell-monitor-rt: bootloader-entry trigger sent "
+					       "on pid 0x%04x",
+					       (unsigned)route.usb_pid);
+				}
 			}
-		}
-		g_hash_table_unref(triggered);
-		(void)self;
-	}
-
-	/* Pass 3 — direct-stage components on the primary, then the
-	 * primary's bootloader-entry trigger. After this returns the
-	 * primary's firmware-mode hidraw fd becomes invalid; the post-
-	 * bootloader flash phase runs against a freshly re-enumerated
-	 * FuDevice instance and is not yet implemented. */
-	{
-		FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(device);
-		guint16 primary_pid = fu_device_get_pid(device);
-		gboolean staged_anything = FALSE;
-
-		components = fu_firmware_get_images(firmware);
-		for (guint i = 0; i < components->len; i++) {
-			FuDellMonitorRtFirmwareComponent *component =
-			    FU_DELL_MONITOR_RT_FIRMWARE_COMPONENT(
-				g_ptr_array_index(components, i));
-			FuDellMonitorRtRoute route = {0};
-			g_autoptr(GBytes) blob = NULL;
-			g_autoptr(GError) error_local = NULL;
-
-			if (!fu_dell_monitor_rt_route_for_component(self, component, &route))
-				continue;
-			if (route.kind != FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE)
-				continue;
-			if (route.usb_pid != primary_pid)
-				continue;
-
-			blob = fu_firmware_get_bytes(FU_FIRMWARE(component), &error_local);
-			if (blob == NULL) {
-				g_prefix_error(&error_local,
-					       "direct stage of %s on primary: ",
-					       fu_firmware_get_id(FU_FIRMWARE(component)));
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				return FALSE;
-			}
-			if (!fu_dell_monitor_rt_device_stage_along_route(&route,
-									 blob,
-									 &error_local)) {
-				g_prefix_error(&error_local,
-					       "%s on primary: ",
-					       fu_firmware_get_id(FU_FIRMWARE(component)));
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				return FALSE;
-			}
-			g_info("dell-monitor-rt: %s staged on primary (%" G_GSIZE_FORMAT
-			       " bytes)",
-			       fu_firmware_get_id(FU_FIRMWARE(component)),
-			       g_bytes_get_size(blob));
-			staged_anything = TRUE;
-		}
-
-		if (staged_anything) {
-			g_autoptr(GError) error_local = NULL;
-			if (!fu_dell_monitor_rt_device_enter_bootloader(self, &error_local)) {
-				g_prefix_error(&error_local,
-					       "primary bootloader entry: ");
-				g_propagate_error(error, g_steal_pointer(&error_local));
-				return FALSE;
-			}
-			g_info("dell-monitor-rt: primary bootloader-entry trigger sent — "
-			       "device should be re-enumerating");
 		}
 	}
 
