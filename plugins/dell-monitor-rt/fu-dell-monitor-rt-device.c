@@ -559,40 +559,48 @@ fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
 }
 
 /*
- * Read the FL5500 scaler chip's firmware version via the I²C tunnel.
- * Sends a DDC/CI vendor command (51 84 c0 99 cc 20 0e) to target
- * 0x6E and parses the M3T105-style ASCII string out of the reply.
- * This is the version Dell's GUI displays — the user-facing
- * "M3T105"-format identifier — and what fwupd should compare against
- * LVFS release metadata. The hub MCU version (read via opcode 0x09)
- * is internal-only diagnostics.
+ * Read the user-facing package version (the "M3T105"-style string Dell
+ * shows in its GUI) from the FL5500 scaler via DDC/CI tunnel.
  *
- * Verified byte-for-byte against frames in
- * captures/u4025qw-update-recap-20260502-185321.pcapng: Dell's
- * binary issues exactly the same 51 84 c0 99 cc 20 0e write to
- * target 0x6E and gets back 51 88 c1 99 4d3354313035 cf with
- * "M3T105" at offset 4 of the DDC/CI reply.
+ * The chip exposes several VCP queries via the same 0xC0/0x99 vendor-
+ * command pair, each selecting a different version field:
+ *
+ *   51 84 c0 99 cc 20 0e   → "753.0AK01.0007"   (scaler component ID)
+ *   51 84 c0 99 ad 18 57   → "ISP#M3T105#"      (user-facing package ←)
+ *   51 84 c0 99 ee 20 2c   → (other sub-version)
+ *   51 84 c0 99 aa 14 5c   → (other sub-version)
+ *   …
+ *
+ * We send the 0xAD selector — the response embeds the M3T105 between
+ * '#' delimiters. After the post-update reload the same query returns
+ * "CHK#M3T105#" instead of "ISP#M3T105#" (a different prefix marking
+ * "the chip has confirmed the new firmware"); we strip either prefix
+ * and surface the inner version unchanged.
+ *
+ * Verified against captures/u4025qw-update-recap-20260502-185321.pcapng:
+ * Dell's binary issues this exact 51 84 c0 99 ad 18 57 frame and reads
+ * back 51 99 c0 55 ad 23 49 53 50 23 4d 33 54 31 30 35 23 …
+ * (ASCII "…ISP#M3T105#…").
+ *
+ * Note: the response opcode is 0xC0 here, not 0xC1 as for the 0xCC
+ * selector — the existing parser's strict 0xC1 check would reject this
+ * reply, so we accept both response opcodes.
  */
 static gboolean
 fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 					      gchar **version_out,
 					      GError **error)
 {
-	/* DDC/CI vendor command 0xC0/0x99 with selector 0xCC/0x20 — reads
-	 * the user-facing firmware version string from the FL5500 scaler.
-	 * For the U4025QW running pre-update this returns "M3T105", the
-	 * Dell-branded version identifier shown in DDPM and the .deb GUI.
-	 *
-	 * Wire layout (DDC/CI):
-	 *   51 84 c0 99 cc 20 0e
+	/* Wire layout (DDC/CI):
+	 *   51 84 c0 99 ad 18 57
 	 *   │  │  └─────┬────┘ │
 	 *   │  │       cmd     XOR-checksum over 0x6E (dest) || all preceding
 	 *   │  length: 0x80 | (number of cmd bytes = 4)
 	 *   src addr (host = 0x51)
 	 *
-	 * Frame 10778 of captures/u4025qw-m3t105-update-171436.pcapng. */
+	 * Frame 188 of captures/u4025qw-update-recap-20260502-185321.pcapng. */
 	const guint8 i2c_request[7] = {
-	    0x51, 0x84, 0xc0, 0x99, 0xcc, 0x20, 0x0e,
+	    0x51, 0x84, 0xc0, 0x99, 0xad, 0x18, 0x57,
 	};
 	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
 	guint8 hub_key[8];
@@ -634,38 +642,67 @@ fu_dell_monitor_rt_device_read_scaler_version(FuDellMonitorRtDevice *self,
 						error))
 		return FALSE;
 
-	/* Expected (from frame 7995 of the pcap):
-	 *   51 90 c1 99 37 35 33 2e 30 41 4b 30 31 2e 30 30 30 37 c4
-	 * The "37..37" stretch is ASCII "753.0AK01.0007".
-	 * If the device returns this, our tunnel reproduces Dell's protocol
-	 * faithfully. Stash whatever ASCII we recognize as the version
-	 * (knowingly a placeholder — we don't yet know which DDC/CI register
-	 * carries the user-facing M3T105 string). */
 	{
 		const guint8 *wire = &response[1]; /* skip report-ID prefix */
-		if (wire[0] == 0x51 && (wire[1] & 0x80) != 0 &&
-		    wire[2] == 0xC1) {
-			/* DDC/CI: byte 1 low 7 bits = number of payload bytes
-			 * (opcode + sub + data, *not* including checksum).
-			 * Data runs from byte 4 (after src/len/op/sub) for
-			 * (len - 2) bytes, then a checksum byte. */
-			gsize len = (wire[1] & 0x7F);
-			if (len >= 2 && len < 60) {
-				g_autoptr(GString) ascii = g_string_new(NULL);
-				for (gsize i = 4; i < (gsize)(len + 2) && i < 60; i++) {
-					if (wire[i] >= 0x20 && wire[i] < 0x7f)
-						g_string_append_c(ascii, wire[i]);
-				}
-				*version_out = g_strdup(ascii->str);
+		gsize len;
+		g_autoptr(GString) ascii = NULL;
+		const gchar *prefix;
+
+		if (wire[0] != 0x51 || (wire[1] & 0x80) == 0 ||
+		    (wire[2] != 0xC0 && wire[2] != 0xC1)) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_READ,
+				    "scaler-version DDC/CI reply malformed: "
+				    "wire[0..3]=%02X %02X %02X %02X",
+				    wire[0], wire[1], wire[2], wire[3]);
+			return FALSE;
+		}
+
+		/* DDC/CI: byte 1 low 7 bits = number of payload bytes
+		 * (opcode + sub + data, *not* including checksum). Data
+		 * runs from byte 4 onward (after src/len/op/sub). */
+		len = (wire[1] & 0x7F);
+		if (len < 2 || len >= 60) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_READ,
+				    "scaler-version DDC/CI reply has bad length 0x%02x",
+				    (unsigned)wire[1]);
+			return FALSE;
+		}
+
+		/* Build a printable-ASCII view of the data area, including
+		 * '#' delimiters. The response has a small fixed header
+		 * (e.g. 55 ad 23) followed by '#'-delimited fields like
+		 *   ISP#M3T105#
+		 *   CHK#M3T105#   (post-update variant)
+		 * We extract the version field by finding the prefix tag
+		 * and taking everything up to the next '#'. */
+		ascii = g_string_new(NULL);
+		for (gsize i = 4; i < (gsize)(len + 2) && i < 60; i++) {
+			if (wire[i] >= 0x20 && wire[i] < 0x7f)
+				g_string_append_c(ascii, (gchar)wire[i]);
+		}
+
+		prefix = strstr(ascii->str, "ISP#");
+		if (prefix == NULL)
+			prefix = strstr(ascii->str, "CHK#");
+		if (prefix != NULL) {
+			const gchar *value = prefix + 4;
+			const gchar *end = strchr(value, '#');
+			if (end != NULL && end > value) {
+				*version_out = g_strndup(value, end - value);
 				return TRUE;
 			}
 		}
+
 		g_set_error(error,
 			    FWUPD_ERROR,
 			    FWUPD_ERROR_READ,
-			    "scaler-version DDC/CI reply malformed: "
-			    "wire[0..3]=%02X %02X %02X %02X",
-			    wire[0], wire[1], wire[2], wire[3]);
+			    "scaler-version reply did not contain ISP#…# or CHK#…# "
+			    "version field; ascii=%s",
+			    ascii->str);
 		return FALSE;
 	}
 }
@@ -792,9 +829,13 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 		return TRUE;
 	}
 
-	/* Step 3: read the user-facing firmware version (e.g. "M3T105") via
-	 * a DDC/CI request to the FL5500 scaler — same byte sequence Dell's
-	 * binary uses (51 84 c0 99 cc 20 0e to target 0x6E, then read back).
+	/* Step 3: read the user-facing package version (e.g. "M3T105") via
+	 * a DDC/CI request to the FL5500 scaler. Dell's binary issues VCP
+	 * selector 0xAD (51 84 c0 99 ad 18 57 to target 0x6E) which returns
+	 * "ISP#M3T105#" — the same string Dell's UI shows. We previously
+	 * read selector 0xCC which returns "753.0AK01.0007" (the scaler
+	 * component's firmware ID, NOT the user-facing version), so the
+	 * surfaced device version was misleading.
 	 *
 	 * We deliberately don't call read_version (the hub MCU's internal
 	 * 0x09 opcode probe) here: Dell's binary doesn't issue 0xC0 0x09
