@@ -90,6 +90,23 @@ static const guint8 DELL_MONITOR_RT_U4025QW_SYNKEY_SEED[18] = {
 #define DELL_MONITOR_RT_I2C_LOADER_CHUNK   64
 #define DELL_MONITOR_RT_I2C_LOADER_FRAME   (2 + DELL_MONITOR_RT_I2C_LOADER_CHUNK)
 
+/* Per-target session-init bytes for the i2c-tunnel ISP loader.
+ * Decoded from captured trace + RTS5409s_IIC_API class behavior:
+ *   WAKE  (5 bytes) — first c6 to a fresh i2c-tunnel target; primes
+ *                     the downstream MCU's ISP loader.
+ *   BEGIN (3 bytes) — second c6 to the same target; signals start of
+ *                     chunked firmware transfer.
+ * Both are followed by a single 1-byte readiness poll. */
+#define DELL_MONITOR_RT_I2C_LOADER_WAKE  { 0x25, 0x03, 0x00, 0x00, 0x02 }
+#define DELL_MONITOR_RT_I2C_LOADER_BEGIN { 0x12, 0x01, 0x01 }
+
+/* Per-chunk polling parameters for the i2c-tunnel ISP loader.
+ * RTS5409s_IIC_API::polling_status() in libhub.so issues up to 20 d6
+ * reads with ~2ms sleeps between, expecting wire-byte 0 == 0x01. */
+#define DELL_MONITOR_RT_I2C_POLL_RETRIES   20
+#define DELL_MONITOR_RT_I2C_POLL_SLEEP_US  2000
+#define DELL_MONITOR_RT_I2C_POLL_READY     0x01
+
 /* Default I²C bus speed config — written into wire byte 10. 0 = default
  * (matches the "this+0x40 == 0" we see right after open). */
 #define DELL_MONITOR_RT_I2C_DEFAULT_SPEED 0x00
@@ -1163,22 +1180,111 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 #define DELL_MONITOR_RT_STAGE_FW_BANK_OFFSET 4     /* wire-byte offset of bank/pass selector */
 
 /*
+ * Poll the downstream MCU's i2c-tunnel ready bit. Mirrors
+ * RTS5409s_IIC_API::polling_status() in libhub.so: issue a 1-byte d6
+ * read; expect wire-byte 0 == 0x01; retry up to N times with a small
+ * sleep between. Returns success only if a poll observed the ready
+ * value within the retry budget.
+ */
+static gboolean
+fu_dell_monitor_rt_device_i2c_tunnel_poll(FuDellMonitorRtDevice *self,
+					  guint8 i2c_target,
+					  GError **error)
+{
+	for (guint attempt = 0; attempt < DELL_MONITOR_RT_I2C_POLL_RETRIES;
+	     attempt++) {
+		guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
+		g_autoptr(GError) error_local = NULL;
+
+		if (!fu_dell_monitor_rt_device_i2c_read(self,
+							i2c_target,
+							1,
+							response,
+							sizeof(response),
+							&error_local)) {
+			/* If the chip is still busy the read may time out;
+			 * keep retrying until the budget runs out. */
+			g_debug("dell-monitor-rt: i2c poll 0x%02x attempt %u "
+				"transport error: %s",
+				i2c_target,
+				attempt,
+				error_local->message);
+		} else if (response[1] == DELL_MONITOR_RT_I2C_POLL_READY) {
+			return TRUE;
+		} else {
+			g_debug("dell-monitor-rt: i2c poll 0x%02x attempt %u "
+				"got 0x%02x (want 0x%02x)",
+				i2c_target,
+				attempt,
+				response[1],
+				DELL_MONITOR_RT_I2C_POLL_READY);
+		}
+		g_usleep(DELL_MONITOR_RT_I2C_POLL_SLEEP_US);
+	}
+	g_set_error(error,
+		    FWUPD_ERROR,
+		    FWUPD_ERROR_TIMED_OUT,
+		    "i2c-tunnel poll for slave 0x%02x timed out after %u "
+		    "attempts (no READY response)",
+		    i2c_target,
+		    DELL_MONITOR_RT_I2C_POLL_RETRIES);
+	return FALSE;
+}
+
+/*
+ * Send one i2c-tunnel session-init command (WAKE or BEGIN) to a
+ * downstream MCU and poll for the ready response. Returns FALSE on
+ * write or poll failure.
+ */
+static gboolean
+fu_dell_monitor_rt_device_i2c_tunnel_init_step(FuDellMonitorRtDevice *self,
+					       guint8 i2c_target,
+					       const gchar *step_name,
+					       const guint8 *bytes,
+					       gsize bytes_len,
+					       GError **error)
+{
+	if (!fu_dell_monitor_rt_device_i2c_write(self,
+						 i2c_target,
+						 bytes,
+						 bytes_len,
+						 error)) {
+		g_prefix_error(error,
+			       "i2c-tunnel %s to 0x%02x failed: ",
+			       step_name,
+			       i2c_target);
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_i2c_tunnel_poll(self, i2c_target, error)) {
+		g_prefix_error(error,
+			       "i2c-tunnel %s to 0x%02x post-poll failed: ",
+			       step_name,
+			       i2c_target);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
  * Stream an ephemeral ISP shim into a downstream MCU's RAM via the i2c
  * tunnel (opcode 0xC6). Used for HUB1 → 0xD4 and HUB2 → 0xD6 — both
- * fire BEFORE bootloader entry, both go through HID-A. Each frame
- * carries `DELL_MONITOR_RT_I2C_LOADER_CMD/SUB` (0x13 0x40) followed by
- * `DELL_MONITOR_RT_I2C_LOADER_CHUNK` (64) bytes of sequential firmware
- * data. Verified bytewise against the captured pcap: HUB1.fw is the
- * concatenation of 2048 such 64-byte chunks, HUB2.fw is 1024 chunks.
+ * fire BEFORE bootloader entry, both go through HID-A.
  *
- * The single cal_auth handshake performed by our caller covers the
- * entire blob — Dell's binary doesn't refresh between chunks within a
- * single blob (only between blobs and around setup). The downstream
- * MCU acks each chunk via 0xD6 status read in the captured trace, but
- * we omit the polling reads here: the emulator leapfrogs past unmatched
- * read events, and on real hardware we expect the writes to be flow-
- * controlled by the HID transport itself (each SET_REPORT blocks until
- * the chip drains its buffer).
+ * Per-target session sequence:
+ *   1. WAKE  (`25 03 00 00 02`, 5 bytes)  + 1-byte poll
+ *   2. BEGIN (`12 01 01`, 3 bytes)        + 1-byte poll
+ *   3. For each 64-byte chunk:
+ *        c6 frame `13 40 <64 bytes>` + 1-byte poll until ready
+ *
+ * Verified bytewise against the captured pcap: HUB1.fw is 2048 chunks
+ * to slave 0xD4, HUB2.fw is 1024 chunks to slave 0xD6, both preceded
+ * by the same WAKE+BEGIN init.
+ *
+ * cal_auth: The single cal_auth handshake performed by our caller
+ * covers the entire blob. Decomp evidence (hub_handshake() in
+ * libdevices.so is a no-op stub; the real hub_force_handshake() is
+ * only called at i2c-tunnel session open/close) confirms per-chunk
+ * re-auth is not required.
  */
 static gboolean
 fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
@@ -1187,6 +1293,8 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 					       FuProgress *progress,
 					       GError **error)
 {
+	const guint8 wake[] = DELL_MONITOR_RT_I2C_LOADER_WAKE;
+	const guint8 begin[] = DELL_MONITOR_RT_I2C_LOADER_BEGIN;
 	const guint8 *blob_data;
 	gsize blob_size;
 	guint nchunks;
@@ -1204,6 +1312,21 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 		return FALSE;
 	}
 	nchunks = (guint)(blob_size / DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+
+	if (!fu_dell_monitor_rt_device_i2c_tunnel_init_step(self,
+							    i2c_target,
+							    "WAKE",
+							    wake,
+							    sizeof(wake),
+							    error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_device_i2c_tunnel_init_step(self,
+							    i2c_target,
+							    "BEGIN",
+							    begin,
+							    sizeof(begin),
+							    error))
+		return FALSE;
 
 	if (progress != NULL)
 		fu_progress_set_steps(progress, nchunks);
@@ -1227,6 +1350,16 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 				       i2c_target,
 				       i,
 				       nchunks);
+			return FALSE;
+		}
+		if (!fu_dell_monitor_rt_device_i2c_tunnel_poll(self,
+							       i2c_target,
+							       error)) {
+			g_prefix_error(error,
+				       "downstream-MCU poll after chunk %u/%u to 0x%02x: ",
+				       i,
+				       nchunks,
+				       i2c_target);
 			return FALSE;
 		}
 
