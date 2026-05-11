@@ -107,17 +107,24 @@ static const guint8 DELL_MONITOR_RT_U4025QW_SYNKEY_SEED[18] = {
 #define DELL_MONITOR_RT_I2C_POLL_SLEEP_US  2000
 #define DELL_MONITOR_RT_I2C_POLL_READY     0x01
 
-/* Default I²C bus speed config — written into wire byte 10. 0 = default
- * (matches the "this+0x40 == 0" we see right after open). */
+/* I²C bus speed config — written into wire byte 10 of the i2c-tunnel
+ * frame. 0 = default (~100 kHz), used for DDC/CI (slave 0x6E) and the
+ * pre-bootloader hub-flash slaves (0xD4/0xD6). 1 = fast-mode (~400 kHz),
+ * used for the TPS6598x USB-PD controller (slave 0x42) and slave 0x94.
+ * The MCU keys SCL generation off this byte, so it must be set per
+ * target rather than left at the boot default. */
 #define DELL_MONITOR_RT_I2C_DEFAULT_SPEED 0x00
+#define DELL_MONITOR_RT_I2C_SPEED_FAST    0x01
 
 /* Wire offsets for I²C-tunnel commands (relative to the 192-byte payload
  * AFTER the report-ID prefix, so callers see them as buf[N+1] in the
  * 193-byte hidraw buffer). */
-#define DELL_MONITOR_RT_I2C_WIRE_LEN_OFFSET     6
-#define DELL_MONITOR_RT_I2C_WIRE_TARGET_OFFSET  8
-#define DELL_MONITOR_RT_I2C_WIRE_SPEED_OFFSET  10
-#define DELL_MONITOR_RT_I2C_WIRE_DATA_OFFSET   64  /* memmove dest in disasm */
+#define DELL_MONITOR_RT_I2C_WIRE_REG_OFFSET      2  /* read: register address */
+#define DELL_MONITOR_RT_I2C_WIRE_LEN_OFFSET      6
+#define DELL_MONITOR_RT_I2C_WIRE_TARGET_OFFSET   8
+#define DELL_MONITOR_RT_I2C_WIRE_REG_FLAG_OFFSET 9  /* read: 1 = use REG_OFFSET */
+#define DELL_MONITOR_RT_I2C_WIRE_SPEED_OFFSET   10
+#define DELL_MONITOR_RT_I2C_WIRE_DATA_OFFSET    64  /* memmove dest in disasm */
 
 /* enable_vdcmd's "you may have noticed I'm a vendor command" auth bytes,
  * placed in the payload at offset 0 (= wire byte 4). Decoded from the
@@ -475,11 +482,12 @@ fu_dell_monitor_rt_device_handshake(FuDellMonitorRtDevice *self,
  *   bytes 64+    I²C payload bytes    (`len` bytes copied here)
  */
 static gboolean
-fu_dell_monitor_rt_device_i2c_write(FuDellMonitorRtDevice *self,
-				    guint8 i2c_target,
-				    const guint8 *data,
-				    gsize len,
-				    GError **error)
+fu_dell_monitor_rt_device_i2c_write_speed(FuDellMonitorRtDevice *self,
+					  guint8 i2c_target,
+					  guint8 speed,
+					  const guint8 *data,
+					  gsize len,
+					  GError **error)
 {
 	guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
 	const gsize data_max =
@@ -501,7 +509,7 @@ fu_dell_monitor_rt_device_i2c_write(FuDellMonitorRtDevice *self,
 	buf[1 + 1] = DELL_MONITOR_RT_OPCODE_I2C_WRITE;
 	buf[1 + DELL_MONITOR_RT_I2C_WIRE_LEN_OFFSET]    = (guint8)len;
 	buf[1 + DELL_MONITOR_RT_I2C_WIRE_TARGET_OFFSET] = i2c_target;
-	buf[1 + DELL_MONITOR_RT_I2C_WIRE_SPEED_OFFSET]  = DELL_MONITOR_RT_I2C_DEFAULT_SPEED;
+	buf[1 + DELL_MONITOR_RT_I2C_WIRE_SPEED_OFFSET]  = speed;
 	if (data != NULL && len > 0) {
 		memcpy(buf + 1 + DELL_MONITOR_RT_I2C_WIRE_DATA_OFFSET,
 		       data,
@@ -516,20 +524,41 @@ fu_dell_monitor_rt_device_i2c_write(FuDellMonitorRtDevice *self,
 					   error);
 }
 
+/* Default-speed wrapper used by everything except PDC. Most slaves
+ * (DDC/CI 0x6E, hub flash 0xD4/0xD6) sit on the standard-mode 100 kHz
+ * bus segment. */
+static gboolean
+fu_dell_monitor_rt_device_i2c_write(FuDellMonitorRtDevice *self,
+				    guint8 i2c_target,
+				    const guint8 *data,
+				    gsize len,
+				    GError **error)
+{
+	return fu_dell_monitor_rt_device_i2c_write_speed(
+	    self, i2c_target, DELL_MONITOR_RT_I2C_DEFAULT_SPEED, data, len, error);
+}
+
 /*
  * Send an I²C-tunnel READ request (opcode 0xD6, byte layout identical
  * to the WRITE except the response data is fetched via HIDIOCGINPUT).
  * `count` is the number of I²C bytes to receive; the response is
  * written to `response_out` starting at offset 1 (skipping the
  * leading HID report-ID byte).
+ *
+ * The `_reg` variant performs a combined "write register addr →
+ * repeated-start → read N bytes" sequence in one operation. Use it
+ * for register-mapped chips (TPS6598x at 0x42, slave 0x94). The plain
+ * read variant is for raw byte streams (DDC/CI, hub flash).
  */
 static gboolean
-fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
-				   guint8 i2c_target,
-				   guint8 count,
-				   guint8 *response,
-				   gsize response_len,
-				   GError **error)
+fu_dell_monitor_rt_device_i2c_read_reg(FuDellMonitorRtDevice *self,
+				       guint8 i2c_target,
+				       guint8 speed,
+				       guint8 reg_addr,
+				       guint8 count,
+				       guint8 *response,
+				       gsize response_len,
+				       GError **error)
 {
 	guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
 
@@ -544,9 +573,20 @@ fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
 
 	buf[1 + 0] = DELL_MONITOR_RT_DIR_WRITE;
 	buf[1 + 1] = DELL_MONITOR_RT_OPCODE_I2C_READ;
+	/* When reading from a register-mapped chip (TPS6598x at 0x42, the
+	 * unidentified 0x94 chip), the i2c-tunnel can do a combined
+	 * "write register addr, repeated-start, read N bytes" sequence in
+	 * one operation. Bytes 2 and 9 of the i2c-tunnel header carry the
+	 * register address and the "use register-prefixed read" flag.
+	 * For raw reads (DDC/CI 0x6E, hub flash 0xD4/0xD6) reg_addr=0 and
+	 * both bytes stay zero. */
+	if (reg_addr != 0) {
+		buf[1 + DELL_MONITOR_RT_I2C_WIRE_REG_OFFSET]      = reg_addr;
+		buf[1 + DELL_MONITOR_RT_I2C_WIRE_REG_FLAG_OFFSET] = 0x01;
+	}
 	buf[1 + DELL_MONITOR_RT_I2C_WIRE_LEN_OFFSET]    = count;
 	buf[1 + DELL_MONITOR_RT_I2C_WIRE_TARGET_OFFSET] = i2c_target;
-	buf[1 + DELL_MONITOR_RT_I2C_WIRE_SPEED_OFFSET]  = DELL_MONITOR_RT_I2C_DEFAULT_SPEED;
+	buf[1 + DELL_MONITOR_RT_I2C_WIRE_SPEED_OFFSET]  = speed;
 
 	fu_dump_raw(G_LOG_DOMAIN, "i2c read req", buf, sizeof(buf));
 	if (!fu_hidraw_device_set_report(FU_HIDRAW_DEVICE(self),
@@ -573,6 +613,26 @@ fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
 
 	fu_dump_raw(G_LOG_DOMAIN, "i2c read response", response, response_len);
 	return TRUE;
+}
+
+/* Default-speed raw read used by everything except PDC. */
+static gboolean
+fu_dell_monitor_rt_device_i2c_read(FuDellMonitorRtDevice *self,
+				   guint8 i2c_target,
+				   guint8 count,
+				   guint8 *response,
+				   gsize response_len,
+				   GError **error)
+{
+	return fu_dell_monitor_rt_device_i2c_read_reg(
+	    self,
+	    i2c_target,
+	    DELL_MONITOR_RT_I2C_DEFAULT_SPEED,
+	    0, /* no register prefix */
+	    count,
+	    response,
+	    response_len,
+	    error);
 }
 
 /*
@@ -1470,6 +1530,447 @@ fu_dell_monitor_rt_device_enter_bootloader(FuDellMonitorRtDevice *self,
 	return TRUE;
 }
 
+/* ----- TI TPS6598x 4CC command primitives -------------------------
+ *
+ * The PDC component (TI TPS6598x USB-C Power Delivery controller) is
+ * programmed via 4-character-code commands over the i2c-tunnel after
+ * bootloader-entry. Slave 0x42 (8-bit) = TPS6598x i2c address. Each
+ * 4CC command is a two-step i2c transaction:
+ *
+ *   1. Write to register 0x09 (Cmd1) the 4CC bytes "FL<c1><c2>".
+ *      Format: c6→0x42 with payload `08 04 46 4c <c1> <c2>` (2 prefix
+ *      bytes + 4-byte command). The chip's TPS6598x BootROM
+ *      interprets register 0x09 writes as commands.
+ *   2. Optional: read response via d6→0x42 count=N+1.
+ *
+ * For commands taking input data, the input goes into register 0x08
+ * (Data1) BEFORE issuing the 4CC. Format: c6→0x42 with payload
+ * `09 LL <data...>` where LL is the data length.
+ *
+ * The 4CC commands we use (decoded from libpdc.so + TI doc SLVUBH2B):
+ *
+ *   FLrr  Set Flash Read Region (load region pointer)
+ *   FLem  Flash Memory Erase
+ *   FLad  Set Flash Memory Write Start Address
+ *   FLwd  Flash Memory Write (32 bytes per call)
+ *   FLrd  Flash Memory Read
+ *   FLvy  Flash Memory Verify
+ */
+
+#define DELL_MONITOR_RT_PDC_I2C_TARGET    0x42
+#define DELL_MONITOR_RT_PDC_REG_CMD1      0x08 /* per TI SLVUBH2B */
+#define DELL_MONITOR_RT_PDC_REG_DATA1     0x09
+#define DELL_MONITOR_RT_PDC_FOURCC_PREFIX 0x4C46 /* "FL" little-endian */
+#define DELL_MONITOR_RT_PDC_CHUNK_SIZE    32
+#define DELL_MONITOR_RT_PDC_REGION0_BASE  0x800
+
+/* Wait for the chip to ack a 4CC command. The TI BootROM clears Cmd1
+ * once the command completes; the response read returns the result
+ * byte. We just want the read to succeed, content is per-command. */
+#define DELL_MONITOR_RT_PDC_ACK_BYTES 4
+#define DELL_MONITOR_RT_PDC_DATA_BYTES 16
+
+/*
+ * Write `len` bytes into TPS6598x register 0x08 (Data1) — the input
+ * buffer for whatever 4CC command will be issued next. The on-wire
+ * payload is `08 LL <data>`; the i2c-tunnel slave is 0x42 (PDC).
+ * Caller's responsibility: a valid cal_auth handshake before the
+ * first call in a session.
+ */
+static gboolean
+fu_dell_monitor_rt_pdc_set_buf(FuDellMonitorRtDevice *self,
+			       const guint8 *data,
+			       gsize len,
+			       GError **error)
+{
+	g_autofree guint8 *payload = NULL;
+	if (len > 64) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "PDC Data1 buffer too large: %" G_GSIZE_FORMAT,
+			    len);
+		return FALSE;
+	}
+	payload = g_malloc(len + 2);
+	payload[0] = DELL_MONITOR_RT_PDC_REG_DATA1;
+	payload[1] = (guint8)len;
+	if (data != NULL && len > 0)
+		memcpy(payload + 2, data, len);
+	if (!fu_dell_monitor_rt_device_i2c_write_speed(self,
+						       DELL_MONITOR_RT_PDC_I2C_TARGET,
+						       DELL_MONITOR_RT_I2C_SPEED_FAST,
+						       payload,
+						       len + 2,
+						       error)) {
+		g_prefix_error(error, "PDC set_buf len=%" G_GSIZE_FORMAT ": ", len);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
+ * Issue a 4CC command on TPS6598x register 0x09 (Cmd1). cmd_str must
+ * be exactly 2 ASCII chars (the "<c1><c2>" tail of "FL<c1><c2>").
+ * On-wire payload: `09 04 46 4c <c1> <c2>`.
+ */
+static gboolean
+fu_dell_monitor_rt_pdc_cmd(FuDellMonitorRtDevice *self,
+			   const gchar *cmd_str,
+			   GError **error)
+{
+	guint8 payload[6];
+	if (cmd_str == NULL || strlen(cmd_str) != 2) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "PDC 4CC tail must be 2 chars, got %s",
+			    cmd_str != NULL ? cmd_str : "(null)");
+		return FALSE;
+	}
+	payload[0] = DELL_MONITOR_RT_PDC_REG_CMD1;
+	payload[1] = 0x04;	     /* command length */
+	payload[2] = 0x46;	     /* 'F' */
+	payload[3] = 0x4c;	     /* 'L' */
+	payload[4] = (guint8)cmd_str[0];
+	payload[5] = (guint8)cmd_str[1];
+	if (!fu_dell_monitor_rt_device_i2c_write_speed(self,
+						       DELL_MONITOR_RT_PDC_I2C_TARGET,
+						       DELL_MONITOR_RT_I2C_SPEED_FAST,
+						       payload,
+						       sizeof(payload),
+						       error)) {
+		g_prefix_error(error, "PDC FL%s issue: ", cmd_str);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* Read `count` bytes from a TPS6598x register. The i2c-tunnel does the
+ * combined "write reg_addr, repeated-start, read count+1 bytes" in one
+ * operation. count+1 because the chip prefixes its response with a
+ * length byte. Returns the payload bytes (after the length prefix) via
+ * response_out. reg_addr is typically 0x08 (Cmd1, for command status)
+ * or 0x09 (Data1, for command response data). */
+static gboolean
+fu_dell_monitor_rt_pdc_read_resp(FuDellMonitorRtDevice *self,
+				 guint8 reg_addr,
+				 guint8 count,
+				 guint8 *response_out,
+				 gsize response_out_len,
+				 GError **error)
+{
+	guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	if (response_out_len < count) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "PDC response buffer too small");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_i2c_read_reg(self,
+						    DELL_MONITOR_RT_PDC_I2C_TARGET,
+						    DELL_MONITOR_RT_I2C_SPEED_FAST,
+						    reg_addr,
+						    count + 1,
+						    buf,
+						    sizeof(buf),
+						    error)) {
+		g_prefix_error(error, "PDC read_resp reg=0x%02x count=%u: ", reg_addr, count);
+		return FALSE;
+	}
+	/* Wire layout (per captured Ioctl responses): TPS6598x register
+	 * reads return `<width_byte> <register_bytes...>`. width_byte is
+	 * the chip-side register width (4 for Cmd1, 64 for Data1 — the
+	 * chip ignores our count_arg here and always reports the full
+	 * register width). We get count_arg bytes of register data after
+	 * width_byte because we asked the i2c-tunnel for count_arg+1
+	 * bytes total. Strip the HID report-id (buf[0]) AND the
+	 * width_byte (buf[1]) and hand the caller just the data. */
+	memcpy(response_out, buf + 2, count);
+	return TRUE;
+}
+
+/* Read both Cmd1 (ack/status) and Data1 (response data) registers — the
+ * ack-then-data pair that follows every 4CC command. Pass NULL for
+ * data_out if the command has no response data to consume. */
+static gboolean
+fu_dell_monitor_rt_pdc_finish_cmd(FuDellMonitorRtDevice *self,
+				  guint8 *data_out,
+				  gsize data_count,
+				  GError **error)
+{
+	guint8 ack[DELL_MONITOR_RT_PDC_ACK_BYTES] = {0};
+	guint8 dummy[DELL_MONITOR_RT_PDC_ACK_BYTES] = {0};
+	if (!fu_dell_monitor_rt_pdc_read_resp(self,
+					      DELL_MONITOR_RT_PDC_REG_CMD1,
+					      DELL_MONITOR_RT_PDC_ACK_BYTES,
+					      ack,
+					      sizeof(ack),
+					      error))
+		return FALSE;
+	/* Always read Data1 too; Wistron's host code does this on every
+	 * 4CC, and the chip is happiest when the round-trip completes
+	 * (an internal busy/ready latch flips on the Data1 read). For
+	 * commands with no return data we discard the bytes. */
+	if (data_out == NULL) {
+		data_out = dummy;
+		data_count = DELL_MONITOR_RT_PDC_ACK_BYTES;
+	}
+	if (!fu_dell_monitor_rt_pdc_read_resp(self,
+					      DELL_MONITOR_RT_PDC_REG_DATA1,
+					      (guint8)data_count,
+					      data_out,
+					      data_count,
+					      error))
+		return FALSE;
+	return TRUE;
+}
+
+/*
+ * Phase A driver — program the TPS6598x SPI flash with the PDC
+ * firmware blob via the 4CC command interface.
+ *
+ * Mirrors libpdc.so::Tps6598xISP::RegionUpdate82's logic, with one
+ * deliberate divergence: Wistron's loop bound has an off-by-one that
+ * reads 32 bytes past the end of the std::vector, writing heap
+ * garbage one chunk past the firmware end. We just don't issue that
+ * extra write (PLUGIN_NOTES "Solved: the 32-byte 'trailer'").
+ *
+ * Wire conventions per TI ref doc SLVUBH2B (TPS6598x host interface):
+ *
+ *   FLrr (Set Flash Read Region):
+ *     Input: 1 byte = region number (bit 0).
+ *     Output: 4-byte LE flash address of the region's start.
+ *
+ *   FLem (Flash Memory Erase):
+ *     Input: 4-byte LE start address + 1-byte sector count.
+ *     Sector size is 4 KB per the doc.
+ *
+ *   FLad (Set Flash Memory Write Start Address):
+ *     Input: 4-byte LE flash address.
+ *
+ *   FLwd (Flash Memory Write):
+ *     Input: 1..64 bytes of data. Address auto-increments after the
+ *     write. We use the same chunk size we want to write.
+ *
+ *   FLvy (Flash Memory Verify):
+ *     Input: 4-byte LE region start address (same as FLad).
+ *     Output: 1-byte status (0 = pass).
+ *
+ * Sequence (matches Wistron, minus the off-by-one):
+ *   1. FLrr(R0)              — discover Region 0's flash base address
+ *   2. FLem(base, ceil(blob_size / 4096))  — erase enough sectors
+ *   3. For each chunk of `blob` from offset chunk_size onwards:
+ *        FLad(base + offset) → FLwd(chunk)
+ *   4. FLad(base) + FLwd(blob[0:chunk_size]) — header-last commit
+ *   5. FLrr(R0) again        — re-read region pointer (Wistron's pattern)
+ *   6. FLvy(base)            — verify the entire region
+ *
+ * Portability notes:
+ *   - Sector size hardcoded to 4 KB per the TPS6598x spec; if a
+ *     future chip variant uses a different sector size we'd need
+ *     to read it from chip-side state, but the doc fixes it for
+ *     this family.
+ *   - Region 0 base address is read from the chip via FLrr, NOT
+ *     hardcoded. This works for any TPS6598x part / Dell product.
+ *   - Chunk size is configurable (1..64); we pick 32 to match
+ *     Wistron's choice (no chip-side reason for that specific
+ *     value; just keeps emulation diffs minimal).
+ */
+#define DELL_MONITOR_RT_PDC_SECTOR_SIZE   4096
+
+static gboolean
+fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
+				      GBytes *blob,
+				      FuProgress *progress,
+				      GError **error)
+{
+	const guint8 *blob_data;
+	gsize blob_size;
+	guint32 base;
+	guint nchunks;
+	guint sector_count;
+	guint8 region_ptr[DELL_MONITOR_RT_PDC_ACK_BYTES] = {0};
+	/* Per TI SLVUBH2B: FLrr input is 1 byte (region number, 0 or 1).
+	 * Wistron's host code stages 4 bytes here — the trailing 3 bytes
+	 * are uninitialized heap (a long-standing off-by-one in their
+	 * std::vector handling); the chip ignores them. We send the
+	 * doc-spec minimum so the plugin is portable across TPS6598x
+	 * variants. The emulator fixture is normalized by
+	 * contrib/pcap-to-fixture.py to match these canonical lengths. */
+	guint8 flrr_input[1] = {0x00};
+	/* Per TI SLVUBH2B: FLem input is 5 bytes [addr_LE(4) + count(1)]. */
+	guint8 flem_input[5] = {0};
+	guint8 base_le[4];
+
+	blob_data = g_bytes_get_data(blob, &blob_size);
+	if (blob_size == 0 ||
+	    blob_size % DELL_MONITOR_RT_PDC_CHUNK_SIZE != 0) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "PDC blob size %" G_GSIZE_FORMAT
+			    " not a multiple of %u",
+			    blob_size,
+			    DELL_MONITOR_RT_PDC_CHUNK_SIZE);
+		return FALSE;
+	}
+	nchunks = (guint)(blob_size / DELL_MONITOR_RT_PDC_CHUNK_SIZE);
+	if (nchunks < 2) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "PDC blob has too few chunks: %u",
+			    nchunks);
+		return FALSE;
+	}
+
+	if (progress != NULL)
+		fu_progress_set_steps(progress, nchunks + 4);
+
+	/* (1) FLrr(R0): discover Region 0's flash base address.
+	 * The chip returns 4 bytes (LE address). We use this as the
+	 * write/erase base — DON'T hardcode per-product. */
+	if (!fu_dell_monitor_rt_pdc_set_buf(self, flrr_input, sizeof(flrr_input), error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_cmd(self, "rr", error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_finish_cmd(self,
+					       region_ptr,
+					       sizeof(region_ptr),
+					       error))
+		return FALSE;
+	base = (guint32)region_ptr[0] |
+	       ((guint32)region_ptr[1] << 8) |
+	       ((guint32)region_ptr[2] << 16) |
+	       ((guint32)region_ptr[3] << 24);
+	g_info("dell-monitor-rt: PDC Region 0 base = 0x%08x (read from chip)", base);
+	if (base == 0 || base == 0xFFFFFFFF) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "PDC FLrr returned suspicious region base 0x%08x",
+			    base);
+		return FALSE;
+	}
+	base_le[0] = (guint8)(base & 0xFF);
+	base_le[1] = (guint8)((base >> 8) & 0xFF);
+	base_le[2] = (guint8)((base >> 16) & 0xFF);
+	base_le[3] = (guint8)((base >> 24) & 0xFF);
+	if (progress != NULL)
+		fu_progress_step_done(progress);
+
+	/* (2) FLem: erase region. Input is 4-byte LE address + 1-byte
+	 * sector count (4 KB sectors per TI spec). */
+	sector_count = (guint)((blob_size + DELL_MONITOR_RT_PDC_SECTOR_SIZE - 1) /
+			       DELL_MONITOR_RT_PDC_SECTOR_SIZE);
+	if (sector_count > 0xFF) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "PDC blob too large: needs %u sectors (max 255)",
+			    sector_count);
+		return FALSE;
+	}
+	memcpy(flem_input, base_le, 4);
+	flem_input[4] = (guint8)sector_count;
+	g_info("dell-monitor-rt: PDC erase %u sectors at 0x%08x", sector_count, base);
+	if (!fu_dell_monitor_rt_pdc_set_buf(self, flem_input, sizeof(flem_input), error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_cmd(self, "em", error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
+		return FALSE;
+	if (progress != NULL)
+		fu_progress_step_done(progress);
+
+	/* (3) Main write loop — chunks 1..(nchunks-1), addresses
+	 * base+chunk_size..base+(nchunks-1)*chunk_size. Skips chunk 0
+	 * (the header); that goes last. Stops at chunk (nchunks-1) — we
+	 * do NOT emit Wistron's iter-(nchunks) past-end write.
+	 */
+	for (guint i = 1; i < nchunks; i++) {
+		guint32 addr = base + (guint32)(i * DELL_MONITOR_RT_PDC_CHUNK_SIZE);
+		const guint8 *src = blob_data + (i * DELL_MONITOR_RT_PDC_CHUNK_SIZE);
+		guint8 addr_le[4];
+		addr_le[0] = (guint8)(addr & 0xFF);
+		addr_le[1] = (guint8)((addr >> 8) & 0xFF);
+		addr_le[2] = (guint8)((addr >> 16) & 0xFF);
+		addr_le[3] = (guint8)((addr >> 24) & 0xFF);
+
+		if (!fu_dell_monitor_rt_pdc_set_buf(self, addr_le, 4, error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_cmd(self, "ad", error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
+			return FALSE;
+
+		if (!fu_dell_monitor_rt_pdc_set_buf(self, src,
+						    DELL_MONITOR_RT_PDC_CHUNK_SIZE,
+						    error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_cmd(self, "wd", error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
+			return FALSE;
+		if (progress != NULL)
+			fu_progress_step_done(progress);
+	}
+
+	/* (4) Header-last write: chunk 0 → flash base. */
+	{
+		if (!fu_dell_monitor_rt_pdc_set_buf(self, base_le, 4, error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_cmd(self, "ad", error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
+			return FALSE;
+
+		if (!fu_dell_monitor_rt_pdc_set_buf(self, blob_data,
+						    DELL_MONITOR_RT_PDC_CHUNK_SIZE,
+						    error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_cmd(self, "wd", error))
+			return FALSE;
+		if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
+			return FALSE;
+	}
+	if (progress != NULL)
+		fu_progress_step_done(progress);
+
+	/* (5) FLrr(R0) again — Dell does a second region-pointer read
+	 * before verify. */
+	if (!fu_dell_monitor_rt_pdc_set_buf(self, flrr_input, sizeof(flrr_input), error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_cmd(self, "rr", error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_finish_cmd(self,
+					       region_ptr,
+					       sizeof(region_ptr),
+					       error))
+		return FALSE;
+	if (progress != NULL)
+		fu_progress_step_done(progress);
+
+	/* (6) FLvy(base): verify the entire region. Same input shape
+	 * as FLad — 4-byte LE address. */
+	if (!fu_dell_monitor_rt_pdc_set_buf(self, base_le, 4, error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_cmd(self, "vy", error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
+		return FALSE;
+	if (progress != NULL)
+		fu_progress_step_done(progress);
+
+	g_info("dell-monitor-rt: PDC programmed, %u chunks (one fewer than "
+	       "Wistron's loop, which has an off-by-one past-end read at "
+	       "flash 0x%x)",
+	       nchunks, base + nchunks * DELL_MONITOR_RT_PDC_CHUNK_SIZE);
+	return TRUE;
+}
+
 /*
  * Per-component pre-bootloader staging route. The .upg's metadata
  * tells us where each component's bytes go; we don't hardcode by id.
@@ -1505,6 +2006,10 @@ typedef enum {
 	FU_DELL_MONITOR_RT_ROUTE_NONE,
 	FU_DELL_MONITOR_RT_ROUTE_I2C_TUNNEL,
 	FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE,
+	/* Post-bootloader path: routed via the primary's i2c-tunnel using
+	 * a chip-specific protocol (e.g. TPS6598x 4CC commands for PDC).
+	 * The route's i2c_target is the chip's 8-bit slave address. */
+	FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER,
 } FuDellMonitorRtRouteKind;
 
 /*
@@ -1675,6 +2180,45 @@ fu_dell_monitor_rt_proto_dsmcu_stage(FuDellMonitorRtDevice *target,
 }
 
 /*
+ * TI TPS6598x USB-PD controller class (chip_guid_alt ea72869e-…).
+ *
+ * Programmed POST-bootloader via the i2c-tunnel using TPS6598x's 4CC
+ * command interface (FLrr/FLem/FLad/FLwd/FLrd/FLvy) on slave 0x42.
+ * The pre-bootloader ISP shim we loaded onto the primary hub MCU is
+ * what executes the i2c-tunnel transactions on the chip side; from
+ * the host's perspective the wire opcodes are still 0xC6/0xD6.
+ *
+ * arm_target is a no-op because by the time we get here the primary
+ * is already running its post-bootloader ISP shim and accepting
+ * i2c-tunnel writes — the cal_auth handshake gets re-done in
+ * stage_blob, just like for the downstream-MCU class.
+ */
+static gboolean
+fu_dell_monitor_rt_proto_pdc_arm(FuDellMonitorRtDevice *target, GError **error)
+{
+	(void)target;
+	(void)error;
+	return TRUE;
+}
+
+static gboolean
+fu_dell_monitor_rt_proto_pdc_stage(FuDellMonitorRtDevice *target,
+				   const FuDellMonitorRtRoute *route,
+				   GBytes *blob,
+				   GError **error)
+{
+	guint8 hub_key[8];
+
+	(void)route; /* slave 0x42 is implicit in pdc_program */
+	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+				      hub_key);
+	if (!fu_dell_monitor_rt_device_handshake(target, hub_key, error))
+		return FALSE;
+	return fu_dell_monitor_rt_device_pdc_program(target, blob, NULL, error);
+}
+
+/*
  * Chip-protocol registry. Adding a new chip class for a future Dell
  * monitor (Parade scaler, Microchip dock controller, …) is a matter
  * of decoding its protocol from libhub.so's matching ISP class and
@@ -1692,6 +2236,12 @@ static const FuDellMonitorRtChipProto FU_DELL_MONITOR_RT_CHIP_PROTOS[] = {
 	.chip_guid_alt = "5f3ba3d6-a0bd-4270-9938-814a45d5c824",
 	.arm_target = fu_dell_monitor_rt_proto_dsmcu_arm,
 	.stage_blob = fu_dell_monitor_rt_proto_dsmcu_stage,
+    },
+    {
+	.name = "TI TPS6598x PD controller (post-bootloader 4CC flash)",
+	.chip_guid_alt = "ea72869e-aa74-401c-8eda-8cf53ab7be72",
+	.arm_target = fu_dell_monitor_rt_proto_pdc_arm,
+	.stage_blob = fu_dell_monitor_rt_proto_pdc_stage,
     },
 };
 
@@ -1772,8 +2322,22 @@ fu_dell_monitor_rt_route_for_component(FuDellMonitorRtDevice *self,
 		return route_out->target != NULL;
 	}
 
-	/* Out-of-range value: post-bootloader payload, scaler, or some
-	 * other routing tag we haven't decoded yet. Leave NONE. */
+	/* If the metadata gives a post-bootloader chip-class GUID + a
+	 * 7-bit i2c address (0x10..0xCF range), treat it as a
+	 * post-bootloader i2c-tunnel route. Currently this covers PDC
+	 * (chip_guid_alt = ea72869e-…, i2c_or_index = 0x21 → slave 0x42
+	 * 8-bit). The chip-protocol handler implements the per-chip
+	 * sequencing. */
+	if (route_out->proto != NULL && i2c_val > 0) {
+		route_out->kind = FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER;
+		route_out->target = fu_dell_monitor_rt_device_find_target_by_pid(self, 0x1100);
+		route_out->i2c_target = (guint8)(i2c_val << 1); /* 7-bit → 8-bit */
+		return route_out->target != NULL;
+	}
+
+	/* Out-of-range value with no recognized chip class: post-bootloader
+	 * payload, scaler, or some other routing tag we haven't decoded
+	 * yet. Leave NONE. */
 	return TRUE;
 }
 
@@ -1946,7 +2510,7 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		g_autoptr(GHashTable) triggered =
 		    g_hash_table_new(g_direct_hash, g_direct_equal);
 
-		/* The three passes match Dell's observed order:
+		/* The four passes match Dell's observed order:
 		 *
 		 *   Pass 1 — every i2c-tunnel component. The proto's stage_blob
 		 *            does its own per-blob cal_auth.
@@ -1956,12 +2520,17 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		 *            so we drain non-primary devices first.
 		 *   Pass 3 — every direct-stage component whose target IS the
 		 *            primary, then the primary's 0xE9. After this pass
-		 *            the primary's firmware-mode hidraw fd becomes
-		 *            invalid; the post-bootloader flash phase runs
-		 *            against a freshly re-enumerated FuDevice and is
-		 *            not yet implemented.
+		 *            the primary is running its post-bootloader ISP
+		 *            shim and accepting i2c-tunnel writes again
+		 *            (via the new shim's protocol).
+		 *   Pass 4 — every post-bootloader component. The chip-class
+		 *            handler runs the chip-specific flash sequence on
+		 *            the primary's i2c bus — currently TPS6598x for
+		 *            PDC. The chip is in bootloader mode by now; no
+		 *            re-enumeration happens until the final commit
+		 *            (handled by fwupd's reload after we return).
 		 */
-		for (guint pass = 0; pass < 3; pass++) {
+		for (guint pass = 0; pass < 4; pass++) {
 			components = fu_firmware_get_images(firmware);
 			for (guint i = 0; i < components->len; i++) {
 				FuDellMonitorRtFirmwareComponent *component =
@@ -2001,6 +2570,9 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 				if (pass == 2 &&
 				    !(route.kind == FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE &&
 				      route.usb_pid == primary_pid))
+					continue;
+				if (pass == 3 &&
+				    route.kind != FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER)
 					continue;
 
 				blob = fu_firmware_get_bytes(FU_FIRMWARE(component),
@@ -2048,6 +2620,12 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 				if (route.kind == FU_DELL_MONITOR_RT_ROUTE_I2C_TUNNEL) {
 					g_info("dell-monitor-rt: %s staged via i2c-tunnel to 0x%02x "
 					       "(%" G_GSIZE_FORMAT " bytes)",
+					       fu_firmware_get_id(FU_FIRMWARE(component)),
+					       (unsigned)route.i2c_target,
+					       g_bytes_get_size(blob));
+				} else if (route.kind == FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER) {
+					g_info("dell-monitor-rt: %s programmed post-bootloader "
+					       "via i2c slave 0x%02x (%" G_GSIZE_FORMAT " bytes)",
 					       fu_firmware_get_id(FU_FIRMWARE(component)),
 					       (unsigned)route.i2c_target,
 					       g_bytes_get_size(blob));
