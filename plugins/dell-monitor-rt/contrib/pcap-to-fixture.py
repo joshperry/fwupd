@@ -71,6 +71,44 @@ BOOTLOADER_ENTER_OPCODE = 0xE9
 # of the 192-byte payload.
 HIDRAW_REPORT_ID_PREFIX = 0x00
 
+# i2c-tunnel write opcode (DIR=0x40, OP=0xC6). Outer frame layout (after
+# the leading Report-ID byte we add elsewhere):
+#   offset 0:  0x40             — direction (host → device)
+#   offset 1:  0xC6             — i2c write
+#   offset 6:  payload length   — bytes at offset 64.. that the chip reads
+#   offset 8:  i2c slave addr
+#   offset 64: payload bytes    — the on-wire I²C payload
+I2C_TUNNEL_WRITE_DIR = 0x40
+I2C_TUNNEL_WRITE_OP = 0xC6
+I2C_TUNNEL_LEN_OFFSET = 6
+I2C_TUNNEL_SLAVE_OFFSET = 8
+I2C_TUNNEL_PAYLOAD_OFFSET = 64
+
+# TPS6598x USB-PD controller (PDC) lives at i2c slave 0x42 behind the
+# i2c-tunnel; per TI SLVUBH2B the host issues 4CC commands by writing
+# `08 04 46 4c <c1> <c2>` to register 0x08 (Cmd1), with input data
+# pre-staged via a write to register 0x09 (Data1) of the form
+# `09 LL <data>`. Wistron's host code over-stages the input buffer for
+# some 4CCs (heap-leak / over-spec length) — the chip ignores trailing
+# bytes, but a doc-correct implementation only stages what the doc says
+# the chip will read. We normalize the captured setbuf writes to the
+# doc-spec lengths so the fixture matches a doc-correct plugin.
+PDC_I2C_SLAVE = 0x42
+PDC_REG_CMD1 = 0x08
+PDC_REG_DATA1 = 0x09
+
+# Doc-spec input lengths for the 4CCs the plugin actually issues, per
+# TI SLVUBH2B section 6 (Flash 4CC commands). Commands whose input is
+# variable-length (e.g. FLwd 1..64 bytes) are absent — the existing
+# length is preserved as-is.
+PDC_4CC_INPUT_LEN = {
+    "rr": 1,  # 1 byte region number
+    "em": 5,  # 4-byte LE address + 1-byte sector count
+    "ad": 4,  # 4-byte LE address
+    "rd": 4,  # 4-byte LE address (per captured trace)
+    "vy": 4,  # 4-byte LE address
+}
+
 
 def _pcap2emulation_path() -> str:
     """Locate fwupd's pcap2emulation.py relative to this script.
@@ -186,6 +224,149 @@ def _add_report_id_prefix(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return rewritten
 
 
+def _decode_write_payload(event: Dict[str, Any]) -> bytes:
+    """Return the raw HID write payload for a Write event, or empty bytes
+    if the event isn't a Write or has no Data."""
+    eid = event.get("Id", "")
+    if not eid.startswith("Write:Data="):
+        return b""
+    b64 = eid.split("Data=", 1)[1].split(",")[0]
+    try:
+        return base64.b64decode(b64) if b64 else b""
+    except Exception:
+        return b""
+
+
+def _i2c_tunnel_write_target(payload: bytes) -> int:
+    """If `payload` is an i2c-tunnel write frame (0x40 0xC6 ...) return
+    the target slave address; else -1.
+
+    Note: This expects the post-Report-ID-prefix frame, where index 0 is
+    the Report-ID byte and the i2c-tunnel header starts at index 1.
+    Pre-prefix frames have the i2c-tunnel header at index 0; we handle
+    both by sniffing for the 0x40/0xC6 pair at offsets 0 OR 1.
+    """
+    if len(payload) >= 9 and payload[0] == I2C_TUNNEL_WRITE_DIR and payload[1] == I2C_TUNNEL_WRITE_OP:
+        return payload[I2C_TUNNEL_SLAVE_OFFSET]
+    if (
+        len(payload) >= 10
+        and payload[0] == HIDRAW_REPORT_ID_PREFIX
+        and payload[1] == I2C_TUNNEL_WRITE_DIR
+        and payload[2] == I2C_TUNNEL_WRITE_OP
+    ):
+        return payload[1 + I2C_TUNNEL_SLAVE_OFFSET]
+    return -1
+
+
+def _i2c_tunnel_payload_view(payload: bytes) -> Tuple[int, bytes, int]:
+    """Return (header_offset, inner_payload_bytes, len_field_offset) for
+    an i2c-tunnel write frame. header_offset is 0 for pre-prefix frames
+    or 1 for post-prefix frames. inner_payload is the bytes the chip
+    actually receives (length = len_field)."""
+    if len(payload) >= 9 and payload[0] == I2C_TUNNEL_WRITE_DIR and payload[1] == I2C_TUNNEL_WRITE_OP:
+        h = 0
+    elif (
+        len(payload) >= 10
+        and payload[0] == HIDRAW_REPORT_ID_PREFIX
+        and payload[1] == I2C_TUNNEL_WRITE_DIR
+        and payload[2] == I2C_TUNNEL_WRITE_OP
+    ):
+        h = 1
+    else:
+        return -1, b"", -1
+    len_off = h + I2C_TUNNEL_LEN_OFFSET
+    pay_off = h + I2C_TUNNEL_PAYLOAD_OFFSET
+    if len(payload) <= len_off or len(payload) < pay_off:
+        return -1, b"", -1
+    n = payload[len_off]
+    return h, bytes(payload[pay_off : pay_off + n]), len_off
+
+
+def _next_pdc_4cc_after(events: List[Dict[str, Any]], start: int) -> str:
+    """Look ahead from `start+1` for the next slave-0x42 4CC command write
+    (`08 04 46 4c <c1> <c2>`). Return the 2-char command tail, or "" if
+    we hit another setbuf or 50-event window first."""
+    for j in range(start + 1, min(start + 50, len(events))):
+        d = _decode_write_payload(events[j])
+        if not d:
+            continue
+        if _i2c_tunnel_write_target(d) != PDC_I2C_SLAVE:
+            continue
+        _h, inner, _lo = _i2c_tunnel_payload_view(d)
+        if len(inner) >= 6 and inner[0] == PDC_REG_CMD1 and inner[1] == 0x04 and inner[2] == 0x46 and inner[3] == 0x4C:
+            return chr(inner[4]) + chr(inner[5])
+        # Another setbuf before any 4CC — pairing is ambiguous.
+        if len(inner) >= 2 and inner[0] == PDC_REG_DATA1:
+            return ""
+    return ""
+
+
+def _rewrite_pdc_setbuf(payload: bytes, new_data: bytes) -> bytes:
+    """Rebuild an i2c-tunnel-write HID frame with the inner PDC setbuf
+    payload replaced by `09 LL new_data`. Outer LEN field at offset 6
+    is updated; bytes between new payload end and old payload end are
+    zeroed; total frame size is preserved."""
+    h, _inner, len_off = _i2c_tunnel_payload_view(payload)
+    if h < 0:
+        return payload
+    pay_off = h + I2C_TUNNEL_PAYLOAD_OFFSET
+    out = bytearray(payload)
+    new_inner = bytes([PDC_REG_DATA1, len(new_data)]) + new_data
+    old_len = out[len_off]
+    new_len = len(new_inner)
+    out[len_off] = new_len
+    # Clear the old payload region within the frame, then write the new
+    # payload. This drops Wistron's heap-leak trailing bytes.
+    for k in range(pay_off, pay_off + max(old_len, new_len)):
+        if k < len(out):
+            out[k] = 0
+    out[pay_off : pay_off + new_len] = new_inner
+    return bytes(out)
+
+
+def _normalize_pdc_setbufs(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Walk events; for each TPS6598x setbuf write (slave 0x42, payload
+    `09 LL <data>`), pair it with the next 4CC command on slave 0x42 and,
+    if the doc spec for that command has a fixed input length shorter
+    than what was captured, rewrite the captured setbuf to the doc-spec
+    length (truncating Wistron's heap-leak trailing bytes).
+
+    This is what makes a doc-correct plugin (sending 1-byte FLrr and
+    5-byte FLem) match a fixture captured from Wistron's host code
+    (which over-stages 4 and 8 bytes respectively)."""
+    rewritten: List[Dict[str, Any]] = []
+    rewrite_count = 0
+    for i, ev in enumerate(events):
+        d = _decode_write_payload(ev)
+        if not d or _i2c_tunnel_write_target(d) != PDC_I2C_SLAVE:
+            rewritten.append(ev)
+            continue
+        _h, inner, _lo = _i2c_tunnel_payload_view(d)
+        # Only setbuf writes (register 0x09) need normalization.
+        if not (len(inner) >= 2 and inner[0] == PDC_REG_DATA1):
+            rewritten.append(ev)
+            continue
+        cmd = _next_pdc_4cc_after(events, i)
+        canon_len = PDC_4CC_INPUT_LEN.get(cmd)
+        captured_data_len = inner[1]
+        if canon_len is None or captured_data_len <= canon_len:
+            rewritten.append(ev)
+            continue
+        # Rewrite: keep the first `canon_len` bytes of the captured input.
+        new_data = bytes(inner[2 : 2 + canon_len])
+        new_payload = _rewrite_pdc_setbuf(d, new_data)
+        new_b64 = base64.b64encode(new_payload).decode("ascii")
+        new_ev = dict(ev)
+        new_ev["Id"] = f"Write:Data={new_b64},Length=0x{len(new_payload):x}"
+        rewritten.append(new_ev)
+        rewrite_count += 1
+    if rewrite_count:
+        sys.stderr.write(
+            f"  normalized {rewrite_count} PDC setbuf writes to doc-spec lengths\n"
+        )
+    return rewritten
+
+
 def _is_c8_staging(event: Dict[str, Any]) -> bool:
     """A Write event whose payload starts 0x00 (Report-ID) + 0x40 (DIR_WRITE)
     + 0xC8 (STAGE_FW) — i.e. one of the 512 ISP-shim-staging frames the
@@ -287,6 +468,19 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
     # Step 2: add Report-ID prefix to every Write/Ioctl event.
     for dev in flat_devices:
         dev["Events"] = _add_report_id_prefix(dev["Events"])
+
+    # Step 2b: normalize TPS6598x set-buffer writes to doc-spec lengths.
+    # Wistron's host code over-stages the input buffer for a few PDC
+    # 4CC commands (FLrr stages 4 bytes when the doc says 1; FLem
+    # stages 8 when the doc says 5) — the chip ignores the trailing
+    # bytes, but a doc-correct host wouldn't have written them. We
+    # rewrite the captured frames so the fixture matches what a
+    # doc-correct plugin emits. Without this, the plugin would have
+    # to copy Wistron's heap-leak bytes verbatim to satisfy the
+    # emulator's strict Write matching, which would tie the plugin
+    # to one specific buggy Wistron build.
+    for dev in flat_devices:
+        dev["Events"] = _normalize_pdc_setbufs(dev["Events"])
 
     # Step 3: emit every device's full event stream into BOTH setup.json
     # and install.json. The earlier pre/post-trigger split was elegant
