@@ -1971,6 +1971,481 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 	return TRUE;
 }
 
+/* ----- Phase B: DISPLAY block-write protocol ----------------------
+ *
+ * The panel-scaler firmware ("DISPLAY" component, ~1.7 MB on the
+ * U4025QW) is delivered to the running RTS5409S host-side ISP shim via
+ * a block-at-a-time stage-and-commit sequence over the primary HID
+ * (no i2c-tunnel). Decoded from libdevices.so:
+ *   RTS5409S_HID::secure_program (the per-block worker)
+ *   RTS5409S_HID::erase_tmp_flash / write_tmp_flash /
+ *   secure_control_gpio / verify_tmp_flash / get_i2c_block_status /
+ *   check_image / get_block_address
+ * plus the outer driver libdisplay.so:RealtekISP::secure_program_rtk.
+ *
+ * Source-blob structure (size = N * 0x10044 + 0x40):
+ *
+ *   block 0:    [4-byte target SPI addr LE] [65536-byte data] [64-byte sig]
+ *   block 1:    same
+ *   ...
+ *   block N-1:  same
+ *   trailer:    [64 bytes — global pubkey]
+ *
+ * Per block on the wire (verified bytewise against block 0 of the
+ * captured trace, events 11925..12439):
+ *   F4   erase_tmp_flash         — clear chip's tmp SRAM scratch
+ *   F1×512 write_tmp_flash       — 128 B/frame to SRAM offsets
+ *                                  0x0000, 0x0080, … 0xFF80 (512 frames
+ *                                  × 128 B = 65536 B). NO F3 polls
+ *                                  interleaved — the F1 loop streams
+ *                                  back-to-back, mirroring the
+ *                                  RTS5409S_HID::secure_program inner
+ *                                  do-while which calls write_tmp_flash
+ *                                  + a progress callback only.
+ *   04   secure_control_gpio(6,1)— commit-prep GPIO assert
+ *   F5   verify_tmp_flash(0,…)   — carries:
+ *                                    byte 4   CRC8/SMBus of block data
+ *                                    byte 6-9 target SPI addr LE
+ *                                    byte 64-127  global pubkey (64 B)
+ *                                    byte 128-191 per-block sig (64 B)
+ *   F3 polls until READY (0xA0)  — post-commit. The captured trace
+ *                                  shows ~4 polls right after F5,
+ *                                  with the bulk of the inter-block
+ *                                  poll activity (~3000+ per block)
+ *                                  happening during the next block's
+ *                                  spi_unit_erase phase, not here.
+ *
+ * The host computes only one thing per block: a CRC8 of the 65536 data
+ * bytes. The pubkey and signature are sliced directly out of the source
+ * blob; the chip does the ECDSA verify internally.
+ *
+ * Wire frame templates (192 bytes, post-report-id):
+ *
+ *   F4: 40 F4 00 00 00 00 00 00 ...                              (no payload)
+ *   F1: 40 F1 <addr_LE32> 80 00 00 00 ... [128 B data]@offset 64
+ *   F3: c0 F3 00 00 00 00 01 00 ...                              (read 1 byte)
+ *   04: 40 04 01 01 06 00 00 00 ...                              (gpio(6,1))
+ *   F5: 40 F5 94 01 <crc8> 00 <addr_LE32> 00... ...
+ *       <64 B global pubkey>@offset 64
+ *       <64 B per-block sig>@offset 128
+ *
+ * NOT YET IMPLEMENTED: the per-block REALTEK_API::spi_unit_erase pass
+ * that runs BEFORE each F4. That pass is a series of i2c-tunnel
+ * writes and reads to slave 0x94 (the FL5500 in ISP mode) that erases
+ * the SPI flash region the chip is about to commit into. Without it,
+ * real hardware would commit into a non-erased region; under emulation
+ * the leapfrog matcher will skip past the captured spi_unit_erase
+ * frames and the F4/F1/04/F5 frames will still match.
+ */
+
+#define DELL_MONITOR_RT_OPCODE_TMP_ERASE         0xF4
+#define DELL_MONITOR_RT_OPCODE_TMP_WRITE         0xF1
+#define DELL_MONITOR_RT_OPCODE_TMP_STATUS_POLL   0xF3
+#define DELL_MONITOR_RT_OPCODE_SECURE_GPIO       0x04
+#define DELL_MONITOR_RT_OPCODE_TMP_VERIFY        0xF5
+
+/* SECURE_PROG_CFG.cfg+0x18 == 0x10044 (validated by RTS5409S_HID::
+ * secure_program — anything else is rejected with status 0x81). */
+#define DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE       0x10044
+#define DELL_MONITOR_RT_DISPLAY_BLOCK_HDR_LEN    4       /* target SPI addr (LE u32) */
+#define DELL_MONITOR_RT_DISPLAY_BLOCK_DATA_LEN   0x10000 /* 65536 B SRAM payload */
+#define DELL_MONITOR_RT_DISPLAY_BLOCK_SIG_LEN    0x40    /* 64 B per-block signature */
+#define DELL_MONITOR_RT_DISPLAY_BLOCK_DATA_OFF   DELL_MONITOR_RT_DISPLAY_BLOCK_HDR_LEN
+#define DELL_MONITOR_RT_DISPLAY_BLOCK_SIG_OFF \
+	(DELL_MONITOR_RT_DISPLAY_BLOCK_DATA_OFF + DELL_MONITOR_RT_DISPLAY_BLOCK_DATA_LEN)
+#define DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN       0x40    /* 64 B trailer = global pubkey */
+
+#define DELL_MONITOR_RT_DISPLAY_F1_CHUNK         0x80    /* 128 B per F1 frame */
+#define DELL_MONITOR_RT_DISPLAY_F1_PER_BLOCK \
+	(DELL_MONITOR_RT_DISPLAY_BLOCK_DATA_LEN / DELL_MONITOR_RT_DISPLAY_F1_CHUNK) /* 512 */
+
+/* Constants observed in the F5 frame (verified against libdevices.so:
+ * RTS5409S_HID::verify_tmp_flash mode-0 path). Wire bytes 2-3 come
+ * from the 4-byte LE store of 0x94f54000 → wire[0..3]=40 F5 94 00;
+ * the chip-state byte at wire[3] is overwritten by this[0x40], the
+ * RTS5409S_HID's bus-speed cache, which is set to 0x01 at session
+ * open by set_bus_speed(0x01) for the post-bootloader fast-mode bus. */
+#define DELL_MONITOR_RT_DISPLAY_VERIFY_BYTE2     0x94
+#define DELL_MONITOR_RT_DISPLAY_VERIFY_BYTE3     DELL_MONITOR_RT_I2C_SPEED_FAST
+
+/* secure_control_gpio(0x06, 0x01) — wire bytes built from
+ * `*(u32*)(buf+0x58) = 0x01044000` then `*(u16*)(buf+0x5c) =
+ * CONCAT11(0x06, 0x01)`, giving wire[0..4] = 40 04 01 01 06. */
+#define DELL_MONITOR_RT_DISPLAY_GPIO_PIN         0x06
+#define DELL_MONITOR_RT_DISPLAY_GPIO_VALUE       0x01
+
+/* F3 status poll READY value. The chip returns 0xA0 in wire byte 0 of
+ * the response when ready for the next F1 / commit step. (Compare
+ * with the i2c-tunnel poll's 0x01-in-wire-byte-0 — different opcode,
+ * different ready encoding, hence a separate constant.) */
+#define DELL_MONITOR_RT_DISPLAY_F3_READY         0xA0
+
+/* Per-block F3-poll budget. The captured trace shows ~6.6 polls per F1
+ * write on average, with rare bursts up to a few dozen at block-finalize
+ * boundaries. 64 retries of ~2 ms each = ~130 ms ceiling per poll
+ * sequence — safe for a chip that rate-limits at single-digit ms. */
+#define DELL_MONITOR_RT_DISPLAY_F3_POLL_RETRIES  64
+#define DELL_MONITOR_RT_DISPLAY_F3_POLL_SLEEP_US 2000
+
+/*
+ * CRC-8/SMBus (poly 0x07, init=0, no input/output reflection, no
+ * xorout). Verified against libdevices.so's
+ * RTS5409S_HID::crc8_lut + RTS5409S_HID::cal_crc8: the binary
+ * tabulates the same polynomial (table[1] == 0x07). Computing the
+ * CRC byte-by-byte at runtime avoids carrying a 256-byte data blob
+ * for what is < 100 LOC of derivation.
+ */
+static guint8
+fu_dell_monitor_rt_crc8_smbus(const guint8 *data, gsize len)
+{
+	guint8 crc = 0;
+	for (gsize i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (int b = 0; b < 8; b++) {
+			crc = (crc & 0x80) ? (guint8)((crc << 1) ^ 0x07)
+					   : (guint8)(crc << 1);
+		}
+	}
+	return crc;
+}
+
+/*
+ * Send one vendor frame whose direction byte is at wire offset 0,
+ * opcode at offset 1, and the rest of the 192-byte buffer is caller-
+ * supplied (we just copy `body` over wire bytes 2.. and zero-fill
+ * the rest). The caller hands us `body` (length `body_len`); we
+ * frame it into a 193-byte hidraw report (1 report-id + 192 wire
+ * bytes) and ship it via fu_hidraw_device_set_report.
+ */
+static gboolean
+fu_dell_monitor_rt_device_send_vendor_frame(FuDellMonitorRtDevice *self,
+					    guint8 opcode,
+					    const guint8 *body,
+					    gsize body_len,
+					    GError **error)
+{
+	guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
+
+	if (body_len > DELL_MONITOR_RT_BUF_SIZE - 3) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INTERNAL,
+			    "vendor frame body too large: %" G_GSIZE_FORMAT,
+			    body_len);
+		return FALSE;
+	}
+	buf[0] = 0;			    /* report-ID */
+	buf[1] = DELL_MONITOR_RT_DIR_WRITE; /* wire byte 0 */
+	buf[2] = opcode;		    /* wire byte 1 */
+	if (body != NULL && body_len > 0)
+		memcpy(buf + 3, body, body_len); /* wire bytes 2.. */
+	return fu_hidraw_device_set_report(FU_HIDRAW_DEVICE(self),
+					   buf,
+					   sizeof(buf),
+					   FU_IO_CHANNEL_FLAG_USE_BLOCKING_IO,
+					   error);
+}
+
+/*
+ * Issue a 0xF3 status poll and return wire byte 0 of the response
+ * (the chip's status code). Mirrors RTS5409S_HID::get_i2c_block_status:
+ * wire frame is c0 F3 00 00 00 00 01 00 ... (read 1 byte), then read
+ * the input report. Returns the status byte in *status_out.
+ */
+static gboolean
+fu_dell_monitor_rt_device_display_f3_read(FuDellMonitorRtDevice *self,
+					  guint8 *status_out,
+					  GError **error)
+{
+	guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
+
+	buf[0] = 0;			   /* report-ID */
+	buf[1] = DELL_MONITOR_RT_DIR_READ; /* wire byte 0: c0 */
+	buf[2] = DELL_MONITOR_RT_OPCODE_TMP_STATUS_POLL; /* wire byte 1: f3 */
+	/* Wire byte 6 = read count, matching RTS5409S_HID::get_i2c_block_status:
+	 * `this[0x5f] = 0x01` lands at +0x5f → wire offset 0x5f - 0x59 = 6. */
+	buf[1 + DELL_MONITOR_RT_I2C_WIRE_LEN_OFFSET] = 0x01;
+	if (!fu_hidraw_device_set_report(FU_HIDRAW_DEVICE(self),
+					 buf,
+					 sizeof(buf),
+					 FU_IO_CHANNEL_FLAG_USE_BLOCKING_IO,
+					 error))
+		return FALSE;
+	/* Read the response via HIDIOCGINPUT — the chip returns
+	 * synchronously through the control pipe, the same way the existing
+	 * vcmd_read helper picks up its responses. The leading byte of the
+	 * input report is the chip's status code (no report-ID prefix on
+	 * the input side; the kernel strips it). */
+	memset(buf, 0, sizeof(buf));
+	{
+		g_autoptr(FuIoctl) ioctl =
+		    fu_udev_device_ioctl_new(FU_UDEV_DEVICE(self));
+		if (!fu_ioctl_execute(ioctl,
+				      HIDIOCGINPUT(sizeof(buf)), /* nocheck:blocked */
+				      buf,
+				      sizeof(buf),
+				      NULL,
+				      DELL_MONITOR_RT_TIMEOUT_MS,
+				      FU_IOCTL_FLAG_NONE,
+				      error))
+			return FALSE;
+	}
+	/* Response layout: buf[0] is the report-ID (always 0x00 on this
+	 * device, since its HID descriptor declares no Report IDs); the
+	 * actual wire bytes start at buf[1]. The chip's status code is
+	 * the first wire byte, so buf[1]. (Same convention as
+	 * fu_dell_monitor_rt_device_vcmd_read which extracts
+	 * `wire = &response[1]` before parsing.) */
+	*status_out = buf[1];
+	return TRUE;
+}
+
+/*
+ * Poll F3 until the chip returns READY (0xA0). Used between every F1
+ * write and after the F5 commit. Returns success when READY observed
+ * within the retry budget.
+ */
+static gboolean
+fu_dell_monitor_rt_device_display_f3_wait_ready(FuDellMonitorRtDevice *self,
+						GError **error)
+{
+	for (guint i = 0; i < DELL_MONITOR_RT_DISPLAY_F3_POLL_RETRIES; i++) {
+		guint8 status = 0;
+		if (!fu_dell_monitor_rt_device_display_f3_read(self,
+							       &status,
+							       error))
+			return FALSE;
+		if (status == DELL_MONITOR_RT_DISPLAY_F3_READY)
+			return TRUE;
+		g_usleep(DELL_MONITOR_RT_DISPLAY_F3_POLL_SLEEP_US);
+	}
+	g_set_error(error,
+		    FWUPD_ERROR,
+		    FWUPD_ERROR_TIMED_OUT,
+		    "DISPLAY F3 status poll: chip never returned READY (0x%02x) "
+		    "after %u attempts",
+		    (guint)DELL_MONITOR_RT_DISPLAY_F3_READY,
+		    (guint)DELL_MONITOR_RT_DISPLAY_F3_POLL_RETRIES);
+	return FALSE;
+}
+
+/*
+ * Stage and commit one DISPLAY block.
+ *
+ *   block              65604-byte slice from the source blob:
+ *                        block[0..4]       per-block addr (LE u32)
+ *                        block[4..0x10004] 65536 B firmware payload
+ *                        block[0x10004..0x10044] 64 B per-block ECDSA sig
+ *   global_pubkey      64 B from the trailing 64 of the whole blob
+ *   flash_start_index  chip-config knob from the component's
+ *                      flash_off_or_size metadata; combines with
+ *                      block[0..4] to produce the real target SPI
+ *                      flash address: target = start*0x10000 + block_addr.
+ *                      Mirrors libdisplay.so:
+ *                         RealtekISP::secure_program_rtk:
+ *                           uVar17 = *(int*)(this+0x1c) * 0x10000 + iVar6;
+ *                      where this+0x1c is set by set_flash_start_index.
+ *
+ * Emits, in order:
+ *   F4 erase_tmp_flash
+ *   F1 × 512 write_tmp_flash
+ *   04 secure_control_gpio(6, 1)
+ *   F5 verify_tmp_flash (with crc8, full target_addr, pubkey, sig)
+ *   F3 wait_ready (post-commit)
+ */
+static gboolean
+fu_dell_monitor_rt_device_display_program_block(FuDellMonitorRtDevice *self,
+						const guint8 *block,
+						const guint8 *global_pubkey,
+						guint32 flash_start_index,
+						GError **error)
+{
+	const guint8 *data = block + DELL_MONITOR_RT_DISPLAY_BLOCK_DATA_OFF;
+	const guint8 *sig = block + DELL_MONITOR_RT_DISPLAY_BLOCK_SIG_OFF;
+	guint32 block_addr = fu_memread_uint32(block, G_LITTLE_ENDIAN);
+	guint32 target_addr = (flash_start_index << 16) + block_addr;
+	guint8 crc;
+	guint8 body[DELL_MONITOR_RT_BUF_SIZE - 3];
+
+	/* F4 erase_tmp_flash — opcode-only, all-zero body. */
+	if (!fu_dell_monitor_rt_device_send_vendor_frame(
+		self,
+		DELL_MONITOR_RT_OPCODE_TMP_ERASE,
+		NULL,
+		0,
+		error)) {
+		g_prefix_error(error, "DISPLAY F4 erase_tmp_flash: ");
+		return FALSE;
+	}
+
+	/* F1 × 512 write_tmp_flash — 128 B chunks at SRAM offsets
+	 * 0x0000, 0x0080, … 0xFF80. wire layout is built from
+	 * RTS5409S_HID::write_tmp_flash:
+	 *   buf[+0x5b..+0x5e] = address (4-byte LE) → wire bytes 2..5
+	 *   buf[+0x5f]        = length              → wire byte 6
+	 *   buf[+0x99..+0x119] = 128 B payload      → wire bytes 64..192
+	 * (wire byte indexing assumes report-ID at -1.) */
+	for (guint i = 0; i < DELL_MONITOR_RT_DISPLAY_F1_PER_BLOCK; i++) {
+		guint32 sram_addr = i * DELL_MONITOR_RT_DISPLAY_F1_CHUNK;
+
+		memset(body, 0, sizeof(body));
+		fu_memwrite_uint32(body + 0, sram_addr, G_LITTLE_ENDIAN);
+		body[4] = DELL_MONITOR_RT_DISPLAY_F1_CHUNK; /* wire byte 6 */
+		/* wire byte 64 == body offset 62 */
+		memcpy(body + (DELL_MONITOR_RT_I2C_WIRE_DATA_OFFSET - 2),
+		       data + sram_addr,
+		       DELL_MONITOR_RT_DISPLAY_F1_CHUNK);
+		if (!fu_dell_monitor_rt_device_send_vendor_frame(
+			self,
+			DELL_MONITOR_RT_OPCODE_TMP_WRITE,
+			body,
+			sizeof(body),
+			error)) {
+			g_prefix_error(error,
+				       "DISPLAY F1 chunk %u (addr 0x%04x): ",
+				       i,
+				       sram_addr);
+			return FALSE;
+		}
+	}
+
+	/* 04 secure_control_gpio(0x06, 0x01) — commit-prep. Wire bytes
+	 * 2..4 come from `*(u32*)(buf+0x58) = 0x01044000` then
+	 * `*(u16*)(buf+0x5c) = CONCAT11(pin=0x06, value=0x01)`, giving
+	 * wire[0..4] = 40 04 01 01 06. */
+	memset(body, 0, sizeof(body));
+	body[0] = 0x01; /* wire byte 2 — high byte of 0x01044000 LE */
+	body[1] = DELL_MONITOR_RT_DISPLAY_GPIO_VALUE; /* wire byte 3 */
+	body[2] = DELL_MONITOR_RT_DISPLAY_GPIO_PIN;   /* wire byte 4 */
+	if (!fu_dell_monitor_rt_device_send_vendor_frame(
+		self,
+		DELL_MONITOR_RT_OPCODE_SECURE_GPIO,
+		body,
+		sizeof(body),
+		error)) {
+		g_prefix_error(error,
+			       "DISPLAY 04 secure_control_gpio(0x%02x, 0x%02x): ",
+			       (guint)DELL_MONITOR_RT_DISPLAY_GPIO_PIN,
+			       (guint)DELL_MONITOR_RT_DISPLAY_GPIO_VALUE);
+		return FALSE;
+	}
+
+	/* F5 verify_tmp_flash mode-0:
+	 *   wire[2]      = 0x94 (constant from `0x94f54000` LE store)
+	 *   wire[3]      = this[0x40] = bus-speed cache = 0x01
+	 *   wire[4]      = CRC8/SMBus over the 65536 data bytes
+	 *   wire[6..10]  = target SPI addr (4-byte LE; from block[0..4])
+	 *   wire[64..128]  = global pubkey (last 64 B of whole blob)
+	 *   wire[128..192] = per-block sig (last 64 B of this block) */
+	crc = fu_dell_monitor_rt_crc8_smbus(data,
+					    DELL_MONITOR_RT_DISPLAY_BLOCK_DATA_LEN);
+	memset(body, 0, sizeof(body));
+	body[0] = DELL_MONITOR_RT_DISPLAY_VERIFY_BYTE2;	     /* wire byte 2 */
+	body[1] = DELL_MONITOR_RT_DISPLAY_VERIFY_BYTE3;	     /* wire byte 3 */
+	body[2] = crc;					     /* wire byte 4 */
+	fu_memwrite_uint32(body + 4, target_addr, G_LITTLE_ENDIAN); /* wire bytes 6..9 */
+	/* wire byte 64 == body offset 62; copy 64 B pubkey there. */
+	memcpy(body + (DELL_MONITOR_RT_I2C_WIRE_DATA_OFFSET - 2),
+	       global_pubkey,
+	       DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN);
+	/* wire byte 128 == body offset 126; copy 64 B sig there. */
+	memcpy(body + (DELL_MONITOR_RT_I2C_WIRE_DATA_OFFSET - 2 +
+		       DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN),
+	       sig,
+	       DELL_MONITOR_RT_DISPLAY_BLOCK_SIG_LEN);
+	if (!fu_dell_monitor_rt_device_send_vendor_frame(
+		self,
+		DELL_MONITOR_RT_OPCODE_TMP_VERIFY,
+		body,
+		sizeof(body),
+		error)) {
+		g_prefix_error(error, "DISPLAY F5 verify_tmp_flash: ");
+		return FALSE;
+	}
+
+	/* F3 status poll until READY (post-commit). */
+	if (!fu_dell_monitor_rt_device_display_f3_wait_ready(self, error)) {
+		g_prefix_error(error, "DISPLAY F3 poll after F5 commit: ");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
+ * Drive the full DISPLAY block-write loop over a decrypted source blob.
+ * Validates the blob is N * 0x10044 + 0x40 (= 26 * 65604 + 64 = 1,705,768
+ * bytes for the U4025QW), slices the trailing 64 B as the global pubkey,
+ * and calls _program_block once per block.
+ */
+static gboolean
+fu_dell_monitor_rt_device_display_program(FuDellMonitorRtDevice *self,
+					  GBytes *blob,
+					  guint32 flash_start_index,
+					  FuProgress *progress,
+					  GError **error)
+{
+	gsize blob_size = 0;
+	const guint8 *blob_data = g_bytes_get_data(blob, &blob_size);
+	gsize body_size;
+	guint nblocks;
+	const guint8 *global_pubkey;
+
+	/* check_image: the sanity tests RTS5409S_HID::check_image runs
+	 * before secure_program — size > 0x40, and the (size - 0x40)
+	 * must be an exact multiple of 0x10044. */
+	if (blob_size <= DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "DISPLAY blob too small: %" G_GSIZE_FORMAT
+			    " bytes (need > %u for trailer)",
+			    blob_size,
+			    (guint)DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN);
+		return FALSE;
+	}
+	body_size = blob_size - DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN;
+	if (body_size % DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE != 0) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "DISPLAY blob body size %" G_GSIZE_FORMAT
+			    " is not a multiple of block size %u",
+			    body_size,
+			    (guint)DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE);
+		return FALSE;
+	}
+	nblocks = (guint)(body_size / DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE);
+	global_pubkey = blob_data + body_size;
+
+	g_info("dell-monitor-rt: DISPLAY %" G_GSIZE_FORMAT
+	       " bytes = %u blocks × %u B + %u B pubkey",
+	       blob_size,
+	       nblocks,
+	       (guint)DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE,
+	       (guint)DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN);
+
+	if (progress != NULL) {
+		fu_progress_set_id(progress, G_STRLOC);
+		fu_progress_set_steps(progress, nblocks);
+	}
+
+	for (guint i = 0; i < nblocks; i++) {
+		const guint8 *block = blob_data + i * DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE;
+		if (!fu_dell_monitor_rt_device_display_program_block(
+			self,
+			block,
+			global_pubkey,
+			flash_start_index,
+			error)) {
+			g_prefix_error(error, "DISPLAY block %u/%u: ", i, nblocks);
+			return FALSE;
+		}
+		if (progress != NULL)
+			fu_progress_step_done(progress);
+	}
+	return TRUE;
+}
+
 /*
  * Per-component pre-bootloader staging route. The .upg's metadata
  * tells us where each component's bytes go; we don't hardcode by id.
@@ -2038,6 +2513,15 @@ typedef struct _FuDellMonitorRtRoute FuDellMonitorRtRoute;
 struct _FuDellMonitorRtChipProto {
 	const gchar *name;
 	const gchar *chip_guid_alt;
+	/* Post-bootloader staging order — protocol handlers with lower
+	 * `phase_order` run before higher ones. PDC (0) must precede
+	 * DISPLAY (1) because that's the order Dell's binary observes
+	 * in the captured trace, and the chip's ISP shim accepts the
+	 * commands in that order. The order is enforced by an outer
+	 * loop in write_firmware that filters by phase_order. Pre-
+	 * bootloader handlers (i2c-tunnel and direct-stage) ignore the
+	 * field — they have their own pass schedule. */
+	guint8 phase_order;
 	gboolean (*arm_target)(FuDellMonitorRtDevice *target, GError **error);
 	gboolean (*stage_blob)(FuDellMonitorRtDevice *target,
 			       const FuDellMonitorRtRoute *route,
@@ -2052,6 +2536,14 @@ struct _FuDellMonitorRtRoute {
 	guint8 i2c_target;
 	const gchar *chip_guid_alt;	   /* metadata, kept for diagnostics */
 	const FuDellMonitorRtChipProto *proto; /* NULL if class is unhandled */
+	/* Component-derived chip-config knobs that the protocol handler
+	 * may need for its wire-format. Populated by route_for_component
+	 * from the .upg metadata; only the handlers that care about them
+	 * read them. Currently only DISPLAY uses flash_start_index (=
+	 * RealtekISP::set_flash_start_index's start arg, used to compute
+	 * the per-block target SPI address as `start * 0x10000 + block_addr`
+	 * in F5's wire bytes 6..9). */
+	guint32 flash_start_index;
 };
 
 /* Downstream-MCU i2c slaves we've decoded sit at 0xD0+ on the primary's
@@ -2219,6 +2711,56 @@ fu_dell_monitor_rt_proto_pdc_stage(FuDellMonitorRtDevice *target,
 }
 
 /*
+ * Panel-scaler "DISPLAY" class (chip_guid_alt 23d1218b-…).
+ *
+ * Programmed POST-bootloader via direct vendor-cmd opcodes (F4/F1/04/F5
+ * + F3 polls) on the primary HID — no i2c-tunnel involved on this side
+ * of the protocol. The chip's host-side ISP shim accepts a per-block
+ * stage-and-commit sequence; the chip then internally relays the bytes
+ * to the panel scaler's SPI flash.
+ *
+ * arm_target is currently a no-op: the cal_auth handshake we re-do in
+ * stage_blob is the only state the chip needs that the post-bootloader
+ * setup didn't already establish. There may be additional priming we
+ * haven't decoded — emulator skips after the F4 frames will tell us.
+ *
+ * NOT YET IMPLEMENTED here: the per-block REALTEK_API::spi_unit_erase
+ * pass that the libdisplay.so outer driver runs BEFORE each block's F4.
+ * That pass is a series of i2c-tunnel writes/reads to slave 0x94. On
+ * real hardware its absence means the chip commits into a non-erased
+ * region; under emulation the leapfrog matcher will skip past the
+ * captured spi_unit_erase frames so the F4/F1/04/F5 sequence still
+ * matches.
+ */
+static gboolean
+fu_dell_monitor_rt_proto_display_arm(FuDellMonitorRtDevice *target, GError **error)
+{
+	(void)target;
+	(void)error;
+	return TRUE;
+}
+
+static gboolean
+fu_dell_monitor_rt_proto_display_stage(FuDellMonitorRtDevice *target,
+				       const FuDellMonitorRtRoute *route,
+				       GBytes *blob,
+				       GError **error)
+{
+	guint8 hub_key[8];
+
+	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+				      hub_key);
+	if (!fu_dell_monitor_rt_device_handshake(target, hub_key, error))
+		return FALSE;
+	return fu_dell_monitor_rt_device_display_program(target,
+							 blob,
+							 route->flash_start_index,
+							 NULL,
+							 error);
+}
+
+/*
  * Chip-protocol registry. Adding a new chip class for a future Dell
  * monitor (Parade scaler, Microchip dock controller, …) is a matter
  * of decoding its protocol from libhub.so's matching ISP class and
@@ -2228,20 +2770,30 @@ static const FuDellMonitorRtChipProto FU_DELL_MONITOR_RT_CHIP_PROTOS[] = {
     {
 	.name = "RTS5409s/RTS5418E hub MCU (c8 RAM stage)",
 	.chip_guid_alt = "55afe793-98e8-470e-ad09-993be2b3b016",
+	.phase_order = 0, /* unused for direct-stage */
 	.arm_target = fu_dell_monitor_rt_proto_rts540x_arm,
 	.stage_blob = fu_dell_monitor_rt_proto_rts540x_stage,
     },
     {
 	.name = "Downstream MCU (i2c-tunnel RAM loader)",
 	.chip_guid_alt = "5f3ba3d6-a0bd-4270-9938-814a45d5c824",
+	.phase_order = 0, /* unused for i2c-tunnel */
 	.arm_target = fu_dell_monitor_rt_proto_dsmcu_arm,
 	.stage_blob = fu_dell_monitor_rt_proto_dsmcu_stage,
     },
     {
 	.name = "TI TPS6598x PD controller (post-bootloader 4CC flash)",
 	.chip_guid_alt = "ea72869e-aa74-401c-8eda-8cf53ab7be72",
+	.phase_order = 0, /* Phase A — runs first */
 	.arm_target = fu_dell_monitor_rt_proto_pdc_arm,
 	.stage_blob = fu_dell_monitor_rt_proto_pdc_stage,
+    },
+    {
+	.name = "Panel scaler DISPLAY (post-bootloader F4/F1/04/F5 stage+commit)",
+	.chip_guid_alt = "23d1218b-1805-42af-874c-1316003b6c7d",
+	.phase_order = 1, /* Phase B — runs after PDC */
+	.arm_target = fu_dell_monitor_rt_proto_display_arm,
+	.stage_blob = fu_dell_monitor_rt_proto_display_stage,
     },
 };
 
@@ -2296,6 +2848,29 @@ fu_dell_monitor_rt_route_for_component(FuDellMonitorRtDevice *self,
 	route_out->chip_guid_alt = chip_guid_alt;
 	route_out->proto = fu_dell_monitor_rt_proto_lookup(chip_guid_alt);
 
+	/* flash_start_index — used by handlers that derive a per-block
+	 * target SPI address from `start * 0x10000 + addr_in_block`. The
+	 * .upg's `flash_off_or_size` field carries the start; for the
+	 * U4025QW DISPLAY this is 0x20, matching the
+	 * RealtekISP::set_flash_start_index(0x20, …) call decompiled
+	 * out of the host-side ISP shim's setup path. Components that
+	 * don't use it leave the field at 0. */
+	{
+		const gchar *flash_off_str =
+		    fu_dell_monitor_rt_firmware_component_get_field_string(
+			component,
+			FU_DELL_MONITOR_RT_FIRMWARE_FIELD_FLASH_OFF_OR_SIZE);
+		guint64 flash_off_val = 0;
+		if (flash_off_str != NULL &&
+		    fu_strtoull(flash_off_str,
+				&flash_off_val,
+				0,
+				0xFFFFFFFF,
+				FU_INTEGER_BASE_AUTO,
+				NULL))
+			route_out->flash_start_index = (guint32)flash_off_val;
+	}
+
 	if (usb_pid_str == NULL || i2c_str == NULL)
 		return FALSE;
 	if (!fu_strtoull(usb_pid_str, &usb_pid_val, 0, 0xFFFF, FU_INTEGER_BASE_AUTO, NULL))
@@ -2322,16 +2897,25 @@ fu_dell_monitor_rt_route_for_component(FuDellMonitorRtDevice *self,
 		return route_out->target != NULL;
 	}
 
-	/* If the metadata gives a post-bootloader chip-class GUID + a
-	 * 7-bit i2c address (0x10..0xCF range), treat it as a
-	 * post-bootloader i2c-tunnel route. Currently this covers PDC
-	 * (chip_guid_alt = ea72869e-…, i2c_or_index = 0x21 → slave 0x42
-	 * 8-bit). The chip-protocol handler implements the per-chip
-	 * sequencing. */
-	if (route_out->proto != NULL && i2c_val > 0) {
+	/* Post-bootloader: any component whose chip-class GUID resolves to
+	 * a known protocol handler. Two sub-cases:
+	 *
+	 *   i2c_val > 0  → i2c-tunnel route (the value is the chip's 7-bit
+	 *                  i2c slave). Currently PDC (chip_guid_alt
+	 *                  ea72869e-…, i2c_or_index = 0x21 → slave 0x42).
+	 *   i2c_val == 0 → no i2c-tunnel; the chip is reachable via
+	 *                  primary HID vendor-cmd opcodes and the route's
+	 *                  i2c_target is unused. Currently DISPLAY
+	 *                  (chip_guid_alt 23d1218b-…), whose handler
+	 *                  emits F4/F1/04/F5 frames directly.
+	 *
+	 * Either way the target is the primary (PID 0x1100) — that's
+	 * where the post-bootloader ISP shim runs. */
+	if (route_out->proto != NULL) {
 		route_out->kind = FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER;
 		route_out->target = fu_dell_monitor_rt_device_find_target_by_pid(self, 0x1100);
-		route_out->i2c_target = (guint8)(i2c_val << 1); /* 7-bit → 8-bit */
+		route_out->i2c_target =
+		    (i2c_val > 0) ? (guint8)(i2c_val << 1) : 0; /* 7-bit → 8-bit */
 		return route_out->target != NULL;
 	}
 
@@ -2523,14 +3107,23 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		 *            the primary is running its post-bootloader ISP
 		 *            shim and accepting i2c-tunnel writes again
 		 *            (via the new shim's protocol).
-		 *   Pass 4 — every post-bootloader component. The chip-class
-		 *            handler runs the chip-specific flash sequence on
-		 *            the primary's i2c bus — currently TPS6598x for
-		 *            PDC. The chip is in bootloader mode by now; no
-		 *            re-enumeration happens until the final commit
-		 *            (handled by fwupd's reload after we return).
+		 *   Pass 4..N — post-bootloader components, sub-ordered by
+		 *            their handler's `phase_order`. Currently:
+		 *              pass 3 (phase_order=0) — TPS6598x PDC flash
+		 *              pass 4 (phase_order=1) — RTS5409S DISPLAY
+		 *                                       block-write loop
+		 *            The two phases must run in this order: the
+		 *            captured trace shows PDC programming entirely
+		 *            precedes DISPLAY programming, and the chip's
+		 *            ISP shim accepts the commands in that order.
+		 *            New post-bootloader handlers slot in by setting
+		 *            their `phase_order` and bumping NUM_PASSES.
 		 */
-		for (guint pass = 0; pass < 4; pass++) {
+#define DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES 3
+#define DELL_MONITOR_RT_POST_BOOTLOADER_PHASES 2
+#define DELL_MONITOR_RT_NUM_PASSES                                                                 \
+	(DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES + DELL_MONITOR_RT_POST_BOOTLOADER_PHASES)
+		for (guint pass = 0; pass < DELL_MONITOR_RT_NUM_PASSES; pass++) {
 			components = fu_firmware_get_images(firmware);
 			for (guint i = 0; i < components->len; i++) {
 				FuDellMonitorRtFirmwareComponent *component =
@@ -2571,9 +3164,14 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 				    !(route.kind == FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE &&
 				      route.usb_pid == primary_pid))
 					continue;
-				if (pass == 3 &&
-				    route.kind != FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER)
-					continue;
+				if (pass >= DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES) {
+					guint phase = pass - DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES;
+					if (route.kind != FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER)
+						continue;
+					if (route.proto == NULL ||
+					    route.proto->phase_order != phase)
+						continue;
+				}
 
 				blob = fu_firmware_get_bytes(FU_FIRMWARE(component),
 							     &error_local);
@@ -2584,6 +3182,23 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 					g_propagate_error(error,
 							  g_steal_pointer(&error_local));
 					return FALSE;
+				}
+				/* Skip placeholder components with no flashable
+				 * bytes — e.g. the .upg's plaintext "DISPLAY"
+				 * entry exists only to declare the chip class
+				 * (chip_guid_alt = 23d1218b-…); the actual
+				 * 1.7 MB payload lives in the matching panel-
+				 * bound component (id = the panel's scaler ID).
+				 * Both components route to the same protocol
+				 * handler, so we let the panel-bound one win
+				 * by skipping any peer with an empty blob. */
+				if (g_bytes_get_size(blob) == 0) {
+					g_debug("dell-monitor-rt: %s has no flashable "
+						"bytes (likely a metadata-only "
+						"placeholder paired with a panel-bound "
+						"sibling); skipping",
+						fu_firmware_get_id(FU_FIRMWARE(component)));
+					continue;
 				}
 
 				/* Arm the (target, proto) pair once. */
@@ -2690,8 +3305,12 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		case FU_DELL_MONITOR_RT_ROUTE_DIRECT_STAGE:
 			route_str = "direct-stage on USB device";
 			break;
+		case FU_DELL_MONITOR_RT_ROUTE_POST_BOOTLOADER:
+			route_str = (route.proto != NULL) ? route.proto->name
+							  : "post-bootloader";
+			break;
 		default:
-			route_str = "post-bootloader (unrouted)";
+			route_str = "(unrouted)";
 			break;
 		}
 		g_info("  component[%u] id=%s version=%s pid=0x%04x i2c=0x%02x route=%s "
