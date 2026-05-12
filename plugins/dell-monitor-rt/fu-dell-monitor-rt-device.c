@@ -2266,6 +2266,346 @@ fu_dell_monitor_rt_device_display_f3_wait_ready(FuDellMonitorRtDevice *self,
 	return FALSE;
 }
 
+/* ----- Phase B helpers: per-block SPI flash erase + verify --------
+ *
+ * Decoded from REALTEK_API in libdisplay.so plus the inter-block wire
+ * trace. Each 64 KB DISPLAY block needs the panel scaler's SPI flash
+ * region for that block's target address erased + verified BEFORE the
+ * F4/F1/04/F5 stage-and-commit sequence stages new bytes for it.
+ *
+ * The SPI flash hangs off i2c slave 0x94 (the post-bootloader RealTek
+ * panel-scaler ISP shim) — we don't talk to flash directly, we talk to
+ * the chip's SPI controller via i2c register pokes. The shim sequences
+ * the actual SPI bus traffic on the chip side.
+ *
+ * Wire format (i2c-tunnel writes/reads to slave 0x94, fast-mode bus):
+ *
+ *   spi_unit_erase(addr, 0x10000):
+ *     write reg 0x64 = (addr >> 16) & 0xFF   ; SPI start-addr MSB
+ *     write reg 0x65 = (addr >>  8) & 0xFF   ; mid
+ *     write reg 0x66 = (addr      ) & 0xFF   ; LSB
+ *     write reg 0x60 = 0xB8                  ; SPI command setup
+ *     write reg 0x61 = 0xD8                  ; SPI 64 KB block-erase opcode
+ *     write reg 0x60 = 0xB9                  ; trigger execute
+ *     [poll reg 0x60 until bit 0 clears — ~120 reads, chip's SPI busy bit]
+ *
+ *   spi_read_crc(addr, 0x10000) → expects 0xDE for an erased 64 KB region:
+ *     write reg 0x64..0x66 = start addr (MSB..LSB), as above
+ *     write reg 0x72 = ((addr+0x10000-1) >> 16) & 0xFF  ; CRC end-addr MSB
+ *     write reg 0x73 = ((addr+0x10000-1) >>  8) & 0xFF  ; mid
+ *     write reg 0x74 = ((addr+0x10000-1)      ) & 0xFF  ; LSB
+ *     read  reg 0x6F                         ; pre-CRC chip status (0x92)
+ *     write reg 0x6F = 0x96                  ; trigger CRC computation
+ *     [poll reg 0x6F until value == 0x92 — ~60 reads, chip computes CRC8]
+ *     read  reg 0x75                         ; CRC8/SMBus result
+ *     compare to 0xDE for 64 KB / 0x09 for 4 KB (precomputed CRC of all-FF)
+ *
+ * The CRC is the same CRC-8/SMBus we already use for F5; on chip side
+ * REALTEK_API::wait_ready busy-waits on bit 0 of reg 0x60 between
+ * trigger and result, and `if (size==0x10000 && crc!=0xde) error;`
+ * is the exact verify check from REALTEK_API::spi_unit_erase decomp.
+ *
+ * Wistron's host code keeps using the same poll-until-status-matches
+ * pattern Dell's stack favors — in our captured trace per inter-block
+ * we see ~120 reg-0x60 polls during the SPI erase + ~60 reg-0x6F polls
+ * during the chip-side CRC computation; both polled at single-digit ms.
+ */
+
+#define DELL_MONITOR_RT_RTKPANEL_I2C_TARGET     0x94
+
+#define DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD    0x60 /* SPI cmd / busy bit-0 */
+#define DELL_MONITOR_RT_RTKPANEL_REG_SPI_DATA   0x61 /* SPI cmd payload byte */
+#define DELL_MONITOR_RT_RTKPANEL_REG_ADDR_HI    0x64 /* SPI start-addr MSB */
+#define DELL_MONITOR_RT_RTKPANEL_REG_ADDR_MID   0x65
+#define DELL_MONITOR_RT_RTKPANEL_REG_ADDR_LO    0x66
+#define DELL_MONITOR_RT_RTKPANEL_REG_END_HI     0x72 /* CRC end-addr MSB */
+#define DELL_MONITOR_RT_RTKPANEL_REG_END_MID    0x73
+#define DELL_MONITOR_RT_RTKPANEL_REG_END_LO     0x74
+#define DELL_MONITOR_RT_RTKPANEL_REG_STATUS     0x6F /* chip-status / CRC trigger */
+#define DELL_MONITOR_RT_RTKPANEL_REG_CRC_RESULT 0x75 /* read CRC8 byte here */
+
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_SETUP    0xB8 /* prepare-cmd phase */
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_TRIGGER  0xB9 /* execute */
+#define DELL_MONITOR_RT_RTKPANEL_SPI_OP_BLK_ERASE 0xD8 /* SPI 64 KB block erase */
+
+#define DELL_MONITOR_RT_RTKPANEL_STATUS_READY     0x92 /* chip done */
+#define DELL_MONITOR_RT_RTKPANEL_STATUS_TRIGGER   0x96 /* write to start CRC */
+
+#define DELL_MONITOR_RT_RTKPANEL_BLOCK_SIZE       0x10000 /* 64 KB */
+#define DELL_MONITOR_RT_RTKPANEL_CRC_64K_ERASED   0xDE /* CRC8 of 65536 0xFFs */
+
+#define DELL_MONITOR_RT_RTKPANEL_BUSY_RETRIES     1024
+#define DELL_MONITOR_RT_RTKPANEL_BUSY_SLEEP_US    500
+
+/*
+ * Write one byte to a register on the panel-scaler chip (slave 0x94)
+ * via the i2c-tunnel. The wire payload is `<reg> <val>`, length 2.
+ */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_write_reg(FuDellMonitorRtDevice *self,
+					     guint8 reg,
+					     guint8 val,
+					     GError **error)
+{
+	const guint8 payload[2] = {reg, val};
+	return fu_dell_monitor_rt_device_i2c_write_speed(
+	    self,
+	    DELL_MONITOR_RT_RTKPANEL_I2C_TARGET,
+	    DELL_MONITOR_RT_I2C_SPEED_FAST,
+	    payload,
+	    sizeof(payload),
+	    error);
+}
+
+/*
+ * Read one byte from a register on the panel-scaler chip (slave 0x94).
+ * Uses the i2c-tunnel's combined write-reg + read-N pattern (reg_addr at
+ * wire byte 2, reg_flag at wire byte 9, count=1). Response wire byte 0
+ * is the register value; that lands at response[1] after the kernel
+ * strips the report-ID prefix from the input report.
+ */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_read_reg(FuDellMonitorRtDevice *self,
+					    guint8 reg,
+					    guint8 *val_out,
+					    GError **error)
+{
+	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	if (!fu_dell_monitor_rt_device_i2c_read_reg(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_I2C_TARGET,
+		DELL_MONITOR_RT_I2C_SPEED_FAST,
+		reg,
+		1,
+		response,
+		sizeof(response),
+		error))
+		return FALSE;
+	/* response[0] = report-ID (stripped value, always 0); response[1]
+	 * = the register value the chip returned. */
+	*val_out = response[1];
+	return TRUE;
+}
+
+/*
+ * Poll a register on slave 0x94 until `done(value)` returns TRUE.
+ * `desc` is just for error messages. Used both for the SPI flash busy
+ * bit (reg 0x60 bit-0 clear) and the chip-side CRC compute (reg 0x6F
+ * value == STATUS_READY).
+ */
+typedef gboolean (*FuDellMonitorRtRtkpanelDoneFn)(guint8 value);
+
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_poll_until(FuDellMonitorRtDevice *self,
+					      guint8 reg,
+					      FuDellMonitorRtRtkpanelDoneFn done,
+					      const gchar *desc,
+					      GError **error)
+{
+	for (guint i = 0; i < DELL_MONITOR_RT_RTKPANEL_BUSY_RETRIES; i++) {
+		guint8 val = 0;
+		if (!fu_dell_monitor_rt_device_rtkpanel_read_reg(self,
+								 reg,
+								 &val,
+								 error))
+			return FALSE;
+		if (done(val))
+			return TRUE;
+		g_usleep(DELL_MONITOR_RT_RTKPANEL_BUSY_SLEEP_US);
+	}
+	g_set_error(error,
+		    FWUPD_ERROR,
+		    FWUPD_ERROR_TIMED_OUT,
+		    "rtkpanel poll reg 0x%02x (%s) timed out after %u attempts",
+		    reg,
+		    desc,
+		    (guint)DELL_MONITOR_RT_RTKPANEL_BUSY_RETRIES);
+	return FALSE;
+}
+
+static gboolean
+fu_dell_monitor_rt_rtkpanel_spi_idle(guint8 v)
+{
+	/* SPI flash busy bit is bit 0 of reg 0x60. Clear → idle. */
+	return (v & 0x01) == 0;
+}
+
+static gboolean
+fu_dell_monitor_rt_rtkpanel_status_ready(guint8 v)
+{
+	return v == DELL_MONITOR_RT_RTKPANEL_STATUS_READY;
+}
+
+/*
+ * Erase one 64 KB SPI flash region at `addr`. Mirrors
+ * REALTEK_API::spi_unit_erase(addr, 0x10000) for the 64-KB-block
+ * variant. Issues the 6-write SPI command sequence, then waits for
+ * bit 0 of reg 0x60 to clear. Caller is responsible for the CRC
+ * verify (spi_read_crc) afterwards if it wants to confirm.
+ */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_spi_erase_64k(FuDellMonitorRtDevice *self,
+						 guint32 addr,
+						 GError **error)
+{
+	struct {
+		guint8 reg;
+		guint8 val;
+	} ops[] = {
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_HI,  (guint8)((addr >> 16) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_MID, (guint8)((addr >>  8) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_LO,  (guint8)((addr      ) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_SETUP},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_DATA, DELL_MONITOR_RT_RTKPANEL_SPI_OP_BLK_ERASE},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_TRIGGER},
+	};
+	for (gsize i = 0; i < G_N_ELEMENTS(ops); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  ops[i].reg,
+								  ops[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel spi_erase_64k addr 0x%08x step %u "
+				       "(reg 0x%02x = 0x%02x): ",
+				       addr,
+				       (guint)i,
+				       (guint)ops[i].reg,
+				       (guint)ops[i].val);
+			return FALSE;
+		}
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_poll_until(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,
+		fu_dell_monitor_rt_rtkpanel_spi_idle,
+		"SPI erase busy",
+		error)) {
+		g_prefix_error(error,
+			       "rtkpanel spi_erase_64k addr 0x%08x: ",
+			       addr);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
+ * Read the chip-computed CRC8/SMBus over `[addr .. addr+0x10000)`.
+ * Mirrors REALTEK_API::spi_read_crc(addr, 0x10000, &crc). The chip
+ * computes the CRC over its current SPI flash contents (post-erase)
+ * and we compare to 0xDE = CRC8/SMBus of 65536 bytes of 0xFF, the
+ * value REALTEK_API::spi_unit_erase asserts on its 64-KB-block path.
+ */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_spi_read_crc_64k(FuDellMonitorRtDevice *self,
+						    guint32 addr,
+						    guint8 *crc_out,
+						    GError **error)
+{
+	guint32 end_addr = addr + DELL_MONITOR_RT_RTKPANEL_BLOCK_SIZE - 1;
+	guint8 status = 0;
+	struct {
+		guint8 reg;
+		guint8 val;
+	} ops[] = {
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_HI,  (guint8)((addr     >> 16) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_MID, (guint8)((addr     >>  8) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_LO,  (guint8)((addr          ) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_END_HI,   (guint8)((end_addr >> 16) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_END_MID,  (guint8)((end_addr >>  8) & 0xFF)},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_END_LO,   (guint8)((end_addr      ) & 0xFF)},
+	};
+	for (gsize i = 0; i < G_N_ELEMENTS(ops); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  ops[i].reg,
+								  ops[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel spi_read_crc range setup addr 0x%08x "
+				       "step %u (reg 0x%02x = 0x%02x): ",
+				       addr,
+				       (guint)i,
+				       (guint)ops[i].reg,
+				       (guint)ops[i].val);
+			return FALSE;
+		}
+	}
+	/* Pre-trigger status read (the chip's "I'm ready for a CRC
+	 * compute" handshake — Wistron checks but doesn't gate on it). */
+	if (!fu_dell_monitor_rt_device_rtkpanel_read_reg(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_STATUS,
+		&status,
+		error)) {
+		g_prefix_error(error,
+			       "rtkpanel spi_read_crc pre-trigger status: ");
+		return FALSE;
+	}
+	/* Trigger the chip-side CRC computation by writing 0x96 to reg
+	 * 0x6F. The chip transitions reg 0x6F from 0x94 (computing) back
+	 * to 0x92 (done) when the result is in reg 0x75. */
+	if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_STATUS,
+		DELL_MONITOR_RT_RTKPANEL_STATUS_TRIGGER,
+		error)) {
+		g_prefix_error(error,
+			       "rtkpanel spi_read_crc trigger: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_poll_until(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_STATUS,
+		fu_dell_monitor_rt_rtkpanel_status_ready,
+		"chip CRC ready",
+		error)) {
+		g_prefix_error(error,
+			       "rtkpanel spi_read_crc compute wait addr 0x%08x: ",
+			       addr);
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_read_reg(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_CRC_RESULT,
+		crc_out,
+		error)) {
+		g_prefix_error(error,
+			       "rtkpanel spi_read_crc result read: ");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
+ * Erase one 64 KB SPI region for `addr` and verify the chip reads the
+ * expected all-erased CRC. Combines spi_erase_64k + spi_read_crc_64k +
+ * the `crc != 0xDE → fail` check from REALTEK_API::spi_unit_erase.
+ */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_erase_and_verify_64k(
+    FuDellMonitorRtDevice *self,
+    guint32 addr,
+    GError **error)
+{
+	guint8 crc = 0;
+	if (!fu_dell_monitor_rt_device_rtkpanel_spi_erase_64k(self, addr, error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_device_rtkpanel_spi_read_crc_64k(self, addr, &crc, error))
+		return FALSE;
+	if (crc != DELL_MONITOR_RT_RTKPANEL_CRC_64K_ERASED) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INTERNAL,
+			    "rtkpanel erase verify failed at addr 0x%08x: "
+			    "chip-computed CRC8 = 0x%02x, expected 0x%02x "
+			    "(CRC of 64 KB of 0xFF)",
+			    addr,
+			    (guint)crc,
+			    (guint)DELL_MONITOR_RT_RTKPANEL_CRC_64K_ERASED);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 /*
  * Stage and commit one DISPLAY block.
  *
@@ -2284,6 +2624,7 @@ fu_dell_monitor_rt_device_display_f3_wait_ready(FuDellMonitorRtDevice *self,
  *                      where this+0x1c is set by set_flash_start_index.
  *
  * Emits, in order:
+ *   spi_unit_erase(target_addr, 64 KB) + spi_read_crc verify (== 0xDE)
  *   F4 erase_tmp_flash
  *   F1 × 512 write_tmp_flash
  *   04 secure_control_gpio(6, 1)
@@ -2303,6 +2644,21 @@ fu_dell_monitor_rt_device_display_program_block(FuDellMonitorRtDevice *self,
 	guint32 target_addr = (flash_start_index << 16) + block_addr;
 	guint8 crc;
 	guint8 body[DELL_MONITOR_RT_BUF_SIZE - 3];
+
+	/* Erase the SPI flash region for this block (64 KB at target_addr)
+	 * and verify the chip computes CRC = 0xDE over the erased region.
+	 * Without this on real hardware the chip's F5 commit would write
+	 * into a non-erased region — flash bits can only be flipped 1→0
+	 * on this kind of NOR flash, so the result would be garbled. */
+	if (!fu_dell_monitor_rt_device_rtkpanel_erase_and_verify_64k(
+		self,
+		target_addr,
+		error)) {
+		g_prefix_error(error,
+			       "DISPLAY pre-block SPI erase at 0x%08x: ",
+			       target_addr);
+		return FALSE;
+	}
 
 	/* F4 erase_tmp_flash — opcode-only, all-zero body. */
 	if (!fu_dell_monitor_rt_device_send_vendor_frame(
