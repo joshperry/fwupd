@@ -2008,12 +2008,14 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
  *                                    byte 6-9 target SPI addr LE
  *                                    byte 64-127  global pubkey (64 B)
  *                                    byte 128-191 per-block sig (64 B)
- *   F3 polls until READY (0xA0)  — post-commit. The captured trace
- *                                  shows ~4 polls right after F5,
- *                                  with the bulk of the inter-block
- *                                  poll activity (~3000+ per block)
- *                                  happening during the next block's
- *                                  spi_unit_erase phase, not here.
+ *   F3 polls until READY          — post-commit. The chip returns
+ *                                  0xA0 (high bit set = busy) until
+ *                                  the F5 commit finishes computing,
+ *                                  then 0x00 (high bit clear, low
+ *                                  nibble clean = ready). The captured
+ *                                  trace shows ~3,400 polls per
+ *                                  inter-block phase — the chip is
+ *                                  genuinely busy that long.
  *
  * The host computes only one thing per block: a CRC8 of the 65536 data
  * bytes. The pubkey and signature are sliced directly out of the source
@@ -2074,18 +2076,38 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 #define DELL_MONITOR_RT_DISPLAY_GPIO_PIN         0x06
 #define DELL_MONITOR_RT_DISPLAY_GPIO_VALUE       0x01
 
-/* F3 status poll READY value. The chip returns 0xA0 in wire byte 0 of
- * the response when ready for the next F1 / commit step. (Compare
- * with the i2c-tunnel poll's 0x01-in-wire-byte-0 — different opcode,
- * different ready encoding, hence a separate constant.) */
-#define DELL_MONITOR_RT_DISPLAY_F3_READY         0xA0
+/* F3 status poll exit conditions. Mirrors the loop in
+ * RTS5409S_HID::secure_program (libdevices.so):
+ *
+ *     do {
+ *         get_i2c_block_status(this, &status);
+ *         if ((this[0x44] - 0x10 < 2) || -1 < (char)status) {
+ *             if ((status & 0xf) != 0) goto error;
+ *             break;            // success
+ *         }
+ *         ...sleep, decrement local_6c retry counter
+ *     } while (local_6c != 0);
+ *
+ * Decoded: the chip returns a one-byte status where the HIGH BIT
+ * (0x80) is the "still busy" flag, and the LOW NIBBLE (0x0F) is an
+ * error code. Polling exits when the high bit clears; if the low
+ * nibble is also zero the operation succeeded. The captured trace
+ * confirms: every F3 poll returns 0xA0 (busy) until exactly one
+ * poll returns 0x00 (ready), then the host moves on. NB: my first
+ * Phase B implementation treated 0xA0 as the READY value — that
+ * was wrong, and only worked under emulation because the captured
+ * fixture's first F3 response is 0xA0 and the plugin took it as
+ * success and proceeded. The correct check is high-bit-clear. */
+#define DELL_MONITOR_RT_DISPLAY_F3_BUSY_BIT      0x80
+#define DELL_MONITOR_RT_DISPLAY_F3_ERROR_NIBBLE  0x0F
 
-/* Per-block F3-poll budget. The captured trace shows ~6.6 polls per F1
- * write on average, with rare bursts up to a few dozen at block-finalize
- * boundaries. 64 retries of ~2 ms each = ~130 ms ceiling per poll
- * sequence — safe for a chip that rate-limits at single-digit ms. */
-#define DELL_MONITOR_RT_DISPLAY_F3_POLL_RETRIES  64
-#define DELL_MONITOR_RT_DISPLAY_F3_POLL_SLEEP_US 2000
+/* Per-block F3-poll budget. The captured trace shows ~3,400 polls per
+ * inter-block phase (post-F5 settle) — the chip is genuinely busy that
+ * long. Wistron's host code uses a 30,000-attempt budget at ~1 ms each
+ * (= 30 s). We match the budget but use a shorter sleep to keep total
+ * wall-clock equivalent. */
+#define DELL_MONITOR_RT_DISPLAY_F3_POLL_RETRIES  30000
+#define DELL_MONITOR_RT_DISPLAY_F3_POLL_SLEEP_US 1000
 
 /*
  * CRC-8/SMBus (poly 0x07, init=0, no input/output reflection, no
@@ -2201,7 +2223,7 @@ fu_dell_monitor_rt_device_display_f3_read(FuDellMonitorRtDevice *self,
 }
 
 /*
- * Poll F3 until the chip returns READY (0xA0). Used between every F1
+ * Poll F3 until the chip clears the busy bit. Used between every F1
  * write and after the F5 commit. Returns success when READY observed
  * within the retry budget.
  */
@@ -2215,16 +2237,31 @@ fu_dell_monitor_rt_device_display_f3_wait_ready(FuDellMonitorRtDevice *self,
 							       &status,
 							       error))
 			return FALSE;
-		if (status == DELL_MONITOR_RT_DISPLAY_F3_READY)
+		/* High bit clear → chip done with whatever it was doing.
+		 * Low nibble carries an error code; non-zero means the chip
+		 * rejected the request and we should propagate the failure
+		 * rather than treat it as ready. */
+		if ((status & DELL_MONITOR_RT_DISPLAY_F3_BUSY_BIT) == 0) {
+			if (status & DELL_MONITOR_RT_DISPLAY_F3_ERROR_NIBBLE) {
+				g_set_error(error,
+					    FWUPD_ERROR,
+					    FWUPD_ERROR_INTERNAL,
+					    "DISPLAY F3 status: chip reported "
+					    "error nibble (status=0x%02x) after "
+					    "%u polls",
+					    status,
+					    i + 1);
+				return FALSE;
+			}
 			return TRUE;
+		}
 		g_usleep(DELL_MONITOR_RT_DISPLAY_F3_POLL_SLEEP_US);
 	}
 	g_set_error(error,
 		    FWUPD_ERROR,
 		    FWUPD_ERROR_TIMED_OUT,
-		    "DISPLAY F3 status poll: chip never returned READY (0x%02x) "
+		    "DISPLAY F3 status poll: chip stayed busy (status & 0x80) "
 		    "after %u attempts",
-		    (guint)DELL_MONITOR_RT_DISPLAY_F3_READY,
 		    (guint)DELL_MONITOR_RT_DISPLAY_F3_POLL_RETRIES);
 	return FALSE;
 }
