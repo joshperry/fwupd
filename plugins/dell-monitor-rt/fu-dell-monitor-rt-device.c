@@ -2323,6 +2323,8 @@ fu_dell_monitor_rt_device_display_f3_wait_ready(FuDellMonitorRtDevice *self,
 #define DELL_MONITOR_RT_RTKPANEL_REG_END_LO     0x74
 #define DELL_MONITOR_RT_RTKPANEL_REG_STATUS     0x6F /* chip-status / CRC trigger */
 #define DELL_MONITOR_RT_RTKPANEL_REG_CRC_RESULT 0x75 /* read CRC8 byte here */
+#define DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_PAGE 0xF4 /* indirect-access page selector */
+#define DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_DATA 0xF5 /* indirect-access data port */
 
 #define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_SETUP    0xB8 /* prepare-cmd phase */
 #define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_TRIGGER  0xB9 /* execute */
@@ -2606,6 +2608,437 @@ fu_dell_monitor_rt_device_rtkpanel_erase_and_verify_64k(
 	return TRUE;
 }
 
+/* ----- Chip-setup helpers (one-shot, before the block loop) --------
+ *
+ * Mirror the call chain in `RealtekISP::disable_wp` (libdisplay.so,
+ * decoded with our Ghidra class-recovery script — see
+ * dell-u4025qw-fw/ghidra/scripts/RecoverWistronClasses.java):
+ *
+ *   enter_isp        — switch chip into ISP mode (reg 0x6F = 0x80 × 3)
+ *   set_default_value — 20 fixed register writes that configure the
+ *                       chip's SPI controller defaults
+ *   spi_disable_wp_pin — chip-config-driven indirect F4/F5 access that
+ *                        reads the SPI flash WP status register and
+ *                        clears its block-protect bits. The exact wire
+ *                        bytes depend on `wp_reg_a` and `wp_reg_b`
+ *                        register addresses sourced from the `.upg`'s
+ *                        per-component `param11` / `param12` metadata
+ *                        (set into REALTEK_API.wp_reg_a/b by
+ *                        RealtekISP::set_write_protect_pin). For
+ *                        U4025QW DISPLAY: param11=0x109B param12=0x223B
+ *                        param13=0x10001 (high word=1 selects the raw
+ *                        encoding path).
+ *   spi_read_jedec_id — read SPI flash JEDEC ID (0x9F op) + Release-
+ *                       from-PD ID (0xAB op). We don't enforce a JEDEC
+ *                       allowlist yet — log for diagnostic value.
+ *   spi_set_wp_status — issue SPI WRSR (opcode 0x01) to commit the
+ *                       new WP status to the flash chip.
+ *   spi_unit_erase    — initial 64 KB erase + CRC verify at
+ *                       (flash_size_or_end << 16); pre-clears the
+ *                       "scratch" region the chip uses during F5
+ *                       commits. Reuses the per-block helper.
+ */
+
+/* enter_isp: 3 hard-coded writes of reg 0x6F=0x80. The decomp's
+ * `iVar6 = 3` retry counter is a literal 3-iter loop, not a poll-
+ * until-success — three writes happen unconditionally on every call,
+ * with a status poll between each. */
+#define DELL_MONITOR_RT_RTKPANEL_ISP_ENTER_VAL   0x80
+#define DELL_MONITOR_RT_RTKPANEL_ISP_ENTER_TRIES 3
+
+/* Helper: poll reg 0x6F until the chip's high bit is SET (in-ISP ack).
+ * The decomp's success branch is `(signed char)local_59 < 0`, i.e.
+ * bit 7 = 1 means "I am now in ISP". This is the OPPOSITE convention
+ * from the F3 chip-status register used elsewhere in this protocol —
+ * for reg 0x6F enter_isp, bit-7-set means READY/in-ISP, while for F3
+ * bit-7-set means BUSY. Different registers, different conventions. */
+static gboolean
+fu_dell_monitor_rt_rtkpanel_status_highbit_set(guint8 v)
+{
+	return (v & 0x80) != 0;
+}
+
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_enter_isp(FuDellMonitorRtDevice *self, GError **error)
+{
+	for (guint i = 0; i < DELL_MONITOR_RT_RTKPANEL_ISP_ENTER_TRIES; i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(
+			self,
+			DELL_MONITOR_RT_RTKPANEL_REG_STATUS,
+			DELL_MONITOR_RT_RTKPANEL_ISP_ENTER_VAL,
+			error)) {
+			g_prefix_error(error, "rtkpanel enter_isp write %u: ", i);
+			return FALSE;
+		}
+		if (!fu_dell_monitor_rt_device_rtkpanel_poll_until(
+			self,
+			DELL_MONITOR_RT_RTKPANEL_REG_STATUS,
+			fu_dell_monitor_rt_rtkpanel_status_highbit_set,
+			"enter_isp wait",
+			error)) {
+			g_prefix_error(error, "rtkpanel enter_isp wait %u: ", i);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+/* set_default_value: 20 hard-coded register writes that put the chip's
+ * SPI controller into the configuration the rest of the protocol
+ * expects. Values verified byte-for-byte against the decomp of
+ * REALTEK_API::set_default_value. */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_set_default_value(FuDellMonitorRtDevice *self,
+						     GError **error)
+{
+	const struct {
+		guint8 reg;
+		guint8 val;
+	} pairs[] = {
+	    {0xF4, 0x9F}, {0xF5, 0x06}, /* indirect-reg 0x9F = 0x06 */
+	    {0xF4, 0xA0}, {0xF5, 0x74}, /* indirect-reg 0xA0 = 0x74 */
+	    {0x1B, 0x02}, {0x1C, 0x30}, {0x1D, 0x1C},
+	    {0x1E, 0x02}, {0x1F, 0x00}, {0x20, 0x1C},
+	    {0x2C, 0x02}, {0x2D, 0x00}, {0x2E, 0x1C},
+	    {0x62, 0x06}, {0x63, 0x50},
+	    {0x6A, 0x03}, {0x6B, 0x0B}, {0x6C, 0x00},
+	    {0xED, 0x84}, {0xEE, 0x04},
+	};
+	for (gsize i = 0; i < G_N_ELEMENTS(pairs); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  pairs[i].reg,
+								  pairs[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel set_default_value step %u "
+				       "(reg 0x%02x = 0x%02x): ",
+				       (guint)i,
+				       (guint)pairs[i].reg,
+				       (guint)pairs[i].val);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+/*
+ * spi_disable_wp_pin: read the SPI flash WP status register via the
+ * chip's indirect-register (`0xF4 = page selector, 0xF5 = data`)
+ * protocol, clear the block-protect (BP) bits, and write the modified
+ * value back into the same indirect register.
+ *
+ * The wire sequence depends on the chip-config bytes that the .upg's
+ * metadata supplied via RealtekISP::set_write_protect_pin → stored
+ * into REALTEK_API.wp_reg_a / wp_reg_b. The high byte of `wp_reg_b`
+ * being `0xFF` (signed = -1) selects a SHORT path that touches a
+ * single direct register at `wp_reg_b & 0xff`; any other value
+ * selects a LONG path that uses two F4/F5 pair sequences. For the
+ * U4025QW DISPLAY (wp_reg_b = 0x223B, high byte = 0x22) we take the
+ * LONG path — which is the one this implementation emits.
+ *
+ * The IN-MEMORY WP status modification done here is committed to the
+ * flash chip by a subsequent `spi_set_wp_status` call.
+ */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_spi_disable_wp_pin(FuDellMonitorRtDevice *self,
+						      guint16 wp_reg_a,
+						      guint16 wp_reg_b,
+						      guint32 chip_flags,
+						      GError **error)
+{
+	struct reg_pair {
+		guint8 reg;
+		guint8 val;
+	};
+	guint8 wp_status_buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	guint8 wp_status;
+	guint8 wp_reg_a_hi = (wp_reg_a >> 8) & 0xFF;
+	guint8 wp_reg_a_lo = (wp_reg_a >> 0) & 0xFF;
+	guint8 wp_reg_b_hi = (wp_reg_b >> 8) & 0xFF;
+	guint8 wp_reg_b_lo = (wp_reg_b >> 0) & 0xFF;
+	guint8 chip_flags_b2 = (chip_flags >> 16) & 0xFF; /* this->chip_flags >> 16 in decomp */
+	const struct reg_pair read_phase[] = {
+	    {DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_PAGE, 0x9F}, /* select WP-config page */
+	    {DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_DATA, wp_reg_a_hi},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_PAGE, wp_reg_a_lo}, /* point at the WP-status sub-reg */
+	};
+	struct reg_pair writeback[6];
+
+	if ((gint8)wp_reg_b_hi == -1) {
+		/* SHORT path (direct register access). Not seen on U4025QW
+		 * but documenting for future chips: read reg wp_reg_b_lo,
+		 * modify, write back. */
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_NOT_SUPPORTED,
+			    "rtkpanel spi_disable_wp_pin: SHORT path (wp_reg_b "
+			    "high byte == 0xFF) not implemented yet — needs a "
+			    "chip with that configuration to validate against. "
+			    "wp_reg_b=0x%04x",
+			    (guint)wp_reg_b);
+		return FALSE;
+	}
+
+	/* LONG path: F4/F5 indirect access to read/modify/writeback the
+	 * WP shadow register, then a second F4/F5 sequence that latches
+	 * the new value via a chip-specific control register. */
+	for (gsize i = 0; i < G_N_ELEMENTS(read_phase); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  read_phase[i].reg,
+								  read_phase[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel spi_disable_wp_pin read-setup step %u: ",
+				       (guint)i);
+			return FALSE;
+		}
+	}
+	/* Now read the indirect-data register (F5) → current WP status. */
+	if (!fu_dell_monitor_rt_device_i2c_read_reg(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_I2C_TARGET,
+		DELL_MONITOR_RT_I2C_SPEED_FAST,
+		DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_DATA,
+		1,
+		wp_status_buf,
+		sizeof(wp_status_buf),
+		error)) {
+		g_prefix_error(error, "rtkpanel spi_disable_wp_pin read WP status: ");
+		return FALSE;
+	}
+	/* response[0] = report-ID, response[1] = chip value. */
+	wp_status = wp_status_buf[1];
+	/* Clear bits 0..2, set bit 0. Matches decomp:
+	 *   local_41 = local_41 & 0xF8 | 1; */
+	wp_status = (wp_status & 0xF8) | 0x01;
+
+	writeback[0] = (struct reg_pair){DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_PAGE, wp_reg_a_lo};
+	writeback[1] = (struct reg_pair){DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_DATA, wp_status};
+	writeback[2] = (struct reg_pair){DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_PAGE, 0x9F};
+	writeback[3] = (struct reg_pair){DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_DATA, wp_reg_b_hi};
+	writeback[4] = (struct reg_pair){DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_PAGE, wp_reg_b_lo};
+	writeback[5] = (struct reg_pair){DELL_MONITOR_RT_RTKPANEL_REG_INDIRECT_DATA, chip_flags_b2};
+	for (gsize i = 0; i < G_N_ELEMENTS(writeback); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  writeback[i].reg,
+								  writeback[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel spi_disable_wp_pin writeback step %u: ",
+				       (guint)i);
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+/* SPI flash JEDEC ID + Release-from-Power-Down ID via the chip's SPI
+ * controller. Reads 4 bytes total: 3 from the JEDEC opcode (0x9F),
+ * 1 from RES (0xAB at addr 0). For diagnostic value — Wistron's
+ * decomp logs the result but doesn't gate behavior on it. We do the
+ * same: log + continue. */
+#define DELL_MONITOR_RT_RTKPANEL_SPI_OP_JEDEC_ID 0x9F
+#define DELL_MONITOR_RT_RTKPANEL_SPI_OP_RES_ID   0xAB
+
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_JEDEC_SETUP   0x46
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_JEDEC_TRIGGER 0x47
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_RES_SETUP     0x5A
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_RES_TRIGGER   0x5B
+
+#define DELL_MONITOR_RT_RTKPANEL_REG_JEDEC_BYTE_0      0x67
+#define DELL_MONITOR_RT_RTKPANEL_REG_JEDEC_BYTE_1      0x68
+#define DELL_MONITOR_RT_RTKPANEL_REG_JEDEC_BYTE_2      0x69
+
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_spi_read_jedec_id(FuDellMonitorRtDevice *self,
+						     GError **error)
+{
+	struct reg_pair {
+		guint8 reg;
+		guint8 val;
+	};
+	guint8 buf[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	guint8 jedec[4] = {0};
+	const struct reg_pair jedec_cmd[] = {
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_JEDEC_SETUP},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_DATA, DELL_MONITOR_RT_RTKPANEL_SPI_OP_JEDEC_ID},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_JEDEC_TRIGGER},
+	};
+	const struct reg_pair res_cmd[] = {
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_RES_SETUP},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_DATA, DELL_MONITOR_RT_RTKPANEL_SPI_OP_RES_ID},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_HI,  0x00}, /* 3-byte addr = 0 */
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_MID, 0x00},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_LO,  0x00},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_RES_TRIGGER},
+	};
+
+	/* Phase 1: JEDEC ID (SPI op 0x9F), reads 3 bytes. */
+	for (gsize i = 0; i < G_N_ELEMENTS(jedec_cmd); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  jedec_cmd[i].reg,
+								  jedec_cmd[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel jedec_id setup step %u: ",
+				       (guint)i);
+			return FALSE;
+		}
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_poll_until(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,
+		fu_dell_monitor_rt_rtkpanel_spi_idle,
+		"jedec_id wait",
+		error))
+		return FALSE;
+	for (guint i = 0; i < 3; i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_read_reg(
+			self,
+			DELL_MONITOR_RT_RTKPANEL_REG_JEDEC_BYTE_0 + i,
+			&jedec[i],
+			error)) {
+			g_prefix_error(error, "rtkpanel jedec_id byte %u: ", i);
+			return FALSE;
+		}
+	}
+
+	/* Phase 2: Release-from-PD ID (SPI op 0xAB), reads 1 byte. */
+	for (gsize i = 0; i < G_N_ELEMENTS(res_cmd); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  res_cmd[i].reg,
+								  res_cmd[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel res_id setup step %u: ",
+				       (guint)i);
+			return FALSE;
+		}
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_poll_until(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,
+		fu_dell_monitor_rt_rtkpanel_spi_idle,
+		"res_id wait",
+		error))
+		return FALSE;
+	if (!fu_dell_monitor_rt_device_rtkpanel_read_reg(
+		self,
+		DELL_MONITOR_RT_RTKPANEL_REG_JEDEC_BYTE_0,
+		&jedec[3],
+		error)) {
+		g_prefix_error(error, "rtkpanel res_id byte: ");
+		return FALSE;
+	}
+	(void)buf;
+
+	g_info("dell-monitor-rt: rtkpanel SPI flash JEDEC=%02x:%02x:%02x RES=%02x",
+	       (guint)jedec[0], (guint)jedec[1], (guint)jedec[2], (guint)jedec[3]);
+	return TRUE;
+}
+
+/* spi_set_wp_status: commit the in-memory WP-status modification to the
+ * flash chip by issuing SPI Write-Status-Register (opcode 0x01).
+ *
+ * Wire sequence:  0x60=0x68, 0x61=0x01, 0x64=<status>, 0x60=0x69
+ *
+ * The status value passed to flash is implicit on this chip: the chip
+ * already has the modified value latched from the earlier
+ * spi_disable_wp_pin call, so we just write 0x00 to the address byte
+ * (the SPI WRSR command takes the status from the chip-side staging
+ * register, not from this i2c bus). The captured trace shows
+ * reg=0x64 val=0x00.
+ */
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_WRSR_SETUP   0x68
+#define DELL_MONITOR_RT_RTKPANEL_SPI_CMD_WRSR_TRIGGER 0x69
+#define DELL_MONITOR_RT_RTKPANEL_SPI_OP_WRITE_STATUS  0x01
+
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_spi_set_wp_status(FuDellMonitorRtDevice *self,
+						     GError **error)
+{
+	const struct {
+		guint8 reg;
+		guint8 val;
+	} pairs[] = {
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_WRSR_SETUP},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_DATA, DELL_MONITOR_RT_RTKPANEL_SPI_OP_WRITE_STATUS},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_HI,  0x00},
+	    {DELL_MONITOR_RT_RTKPANEL_REG_SPI_CMD,  DELL_MONITOR_RT_RTKPANEL_SPI_CMD_WRSR_TRIGGER},
+	};
+	for (gsize i = 0; i < G_N_ELEMENTS(pairs); i++) {
+		if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(self,
+								  pairs[i].reg,
+								  pairs[i].val,
+								  error)) {
+			g_prefix_error(error,
+				       "rtkpanel spi_set_wp_status step %u: ",
+				       (guint)i);
+			return FALSE;
+		}
+	}
+	/* No wait_ready here — the captured trace shows the chip absorbs
+	 * the WRSR command synchronously and the next operation (initial
+	 * erase) proceeds immediately. If real hardware needs a wait we'll
+	 * see it as an emulator skip on the next sub-step. */
+	return TRUE;
+}
+
+/*
+ * One-shot chip-setup sequence run once at the start of DISPLAY
+ * programming. Mirrors RealtekISP::disable_wp() + the pre-loop initial
+ * erase from RealtekISP::secure_program_rtk().
+ *
+ *   wp_reg_a, wp_reg_b, chip_flags  — from .upg param11/12/13, used by
+ *                                     spi_disable_wp_pin
+ *   flash_end_index                 — .upg flash_size_or_end << 16 is
+ *                                     the address of the chip's
+ *                                     "scratch" 64 KB region; initial
+ *                                     erase clears it before block 0
+ */
+static gboolean
+fu_dell_monitor_rt_device_rtkpanel_setup(FuDellMonitorRtDevice *self,
+					 guint16 wp_reg_a,
+					 guint16 wp_reg_b,
+					 guint32 chip_flags,
+					 guint32 flash_end_index,
+					 GError **error)
+{
+	if (!fu_dell_monitor_rt_device_rtkpanel_enter_isp(self, error)) {
+		g_prefix_error(error, "rtkpanel setup: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_set_default_value(self, error)) {
+		g_prefix_error(error, "rtkpanel setup: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_spi_disable_wp_pin(
+		self, wp_reg_a, wp_reg_b, chip_flags, error)) {
+		g_prefix_error(error, "rtkpanel setup: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_spi_read_jedec_id(self, error)) {
+		g_prefix_error(error, "rtkpanel setup: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_rtkpanel_spi_set_wp_status(self, error)) {
+		g_prefix_error(error, "rtkpanel setup: ");
+		return FALSE;
+	}
+	/* Initial erase at (flash_end_index << 16). Reuses the per-block
+	 * helper, which also CRC-verifies the result. */
+	if (!fu_dell_monitor_rt_device_rtkpanel_erase_and_verify_64k(
+		self,
+		flash_end_index << 16,
+		error)) {
+		g_prefix_error(error,
+			       "rtkpanel setup: initial erase at 0x%08x: ",
+			       (guint)(flash_end_index << 16));
+		return FALSE;
+	}
+	return TRUE;
+}
+
 /*
  * Stage and commit one DISPLAY block.
  *
@@ -2774,6 +3207,10 @@ static gboolean
 fu_dell_monitor_rt_device_display_program(FuDellMonitorRtDevice *self,
 					  GBytes *blob,
 					  guint32 flash_start_index,
+					  guint32 flash_end_index,
+					  guint16 wp_reg_a,
+					  guint16 wp_reg_b,
+					  guint32 chip_flags,
 					  FuProgress *progress,
 					  GError **error)
 {
@@ -2816,6 +3253,23 @@ fu_dell_monitor_rt_device_display_program(FuDellMonitorRtDevice *self,
 	       nblocks,
 	       (guint)DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE,
 	       (guint)DELL_MONITOR_RT_DISPLAY_PUBKEY_LEN);
+
+	/* Pre-block-loop chip setup. Mirrors RealtekISP::secure_program_rtk's
+	 * pre-amble: enter_isp → set_default_value → spi_disable_wp_pin →
+	 * spi_read_jedec_id → spi_set_wp_status → initial 64 KB erase at
+	 * (flash_end_index << 16). Without this the panel scaler's SPI flash
+	 * is write-protected and the per-block F4/F1/04/F5 commits won't
+	 * land. Under emulation the leapfrog matcher would hide this — but
+	 * we'd lose the chip ID / WP state we want for real hardware. */
+	if (!fu_dell_monitor_rt_device_rtkpanel_setup(self,
+						     wp_reg_a,
+						     wp_reg_b,
+						     chip_flags,
+						     flash_end_index,
+						     error)) {
+		g_prefix_error(error, "DISPLAY pre-block setup: ");
+		return FALSE;
+	}
 
 	if (progress != NULL) {
 		fu_progress_set_id(progress, G_STRLOC);
@@ -2932,11 +3386,41 @@ struct _FuDellMonitorRtRoute {
 	/* Component-derived chip-config knobs that the protocol handler
 	 * may need for its wire-format. Populated by route_for_component
 	 * from the .upg metadata; only the handlers that care about them
-	 * read them. Currently only DISPLAY uses flash_start_index (=
-	 * RealtekISP::set_flash_start_index's start arg, used to compute
-	 * the per-block target SPI address as `start * 0x10000 + block_addr`
-	 * in F5's wire bytes 6..9). */
+	 * read them.
+	 *
+	 *   flash_start_index  RealtekISP::set_flash_start_index's start
+	 *                      arg — used by DISPLAY's F5 wire bytes 6..9
+	 *                      to compute `start * 0x10000 + block_addr`.
+	 *                      Comes from the .upg's flash_off_or_size field.
+	 *                      For the U4025QW DISPLAY this is 0x20.
+	 *
+	 *   flash_end_index    RealtekISP::set_flash_start_index's end arg —
+	 *                      used by DISPLAY's pre-block-loop initial
+	 *                      64 KB erase at `end * 0x10000`. Comes from
+	 *                      the .upg's flash_size_or_end field.
+	 *
+	 *   wp_reg_a/wp_reg_b  Per-chip SPI flash write-protect register
+	 *                      addresses. REALTEK_API::spi_disable_wp_pin
+	 *                      reads/modifies/writes the WP-status SR via
+	 *                      these two 16-bit register addresses (high
+	 *                      byte = page on F4, low byte = sub-reg on F4).
+	 *                      For U4025QW DISPLAY these come from the .upg's
+	 *                      param11 (=0x109B) and param12 (=0x223B) —
+	 *                      passed through RealtekISP::set_write_protect_pin
+	 *                      in the original stack.
+	 *
+	 *   chip_flags         Bit-flags REALTEK_API uses for chip variants;
+	 *                      ctor sets 0x01010001 by default, override
+	 *                      comes from the .upg's param13. Currently the
+	 *                      WP-pin path consumes only the low bit (0 =
+	 *                      add-write-mask, 1 = raw-write encoding) and
+	 *                      a high-byte sentinel (0xFF = skip second
+	 *                      indirect-data write for wp_reg_b). */
 	guint32 flash_start_index;
+	guint32 flash_end_index;
+	guint16 wp_reg_a;
+	guint16 wp_reg_b;
+	guint32 chip_flags;
 };
 
 /* Downstream-MCU i2c slaves we've decoded sit at 0xD0+ on the primary's
@@ -3149,6 +3633,10 @@ fu_dell_monitor_rt_proto_display_stage(FuDellMonitorRtDevice *target,
 	return fu_dell_monitor_rt_device_display_program(target,
 							 blob,
 							 route->flash_start_index,
+							 route->flash_end_index,
+							 route->wp_reg_a,
+							 route->wp_reg_b,
+							 route->chip_flags,
 							 NULL,
 							 error);
 }
@@ -3241,27 +3729,60 @@ fu_dell_monitor_rt_route_for_component(FuDellMonitorRtDevice *self,
 	route_out->chip_guid_alt = chip_guid_alt;
 	route_out->proto = fu_dell_monitor_rt_proto_lookup(chip_guid_alt);
 
-	/* flash_start_index — used by handlers that derive a per-block
-	 * target SPI address from `start * 0x10000 + addr_in_block`. The
-	 * .upg's `flash_off_or_size` field carries the start; for the
-	 * U4025QW DISPLAY this is 0x20, matching the
-	 * RealtekISP::set_flash_start_index(0x20, …) call decompiled
-	 * out of the host-side ISP shim's setup path. Components that
-	 * don't use it leave the field at 0. */
+	/* flash_start_index / flash_end_index — handlers that derive a
+	 * per-block target SPI address from `start * 0x10000 + addr_in_block`
+	 * and an initial erase at `end * 0x10000`. The .upg's
+	 * `flash_off_or_size` field carries the start; `flash_size_or_end`
+	 * carries the end. For the U4025QW DISPLAY these are 0x20 and 0x39,
+	 * matching the RealtekISP::set_flash_start_index(0x20, 0x39) call
+	 * decompiled out of the host-side ISP shim's setup path. Components
+	 * that don't use them leave the fields at 0.
+	 *
+	 * wp_reg_a / wp_reg_b / chip_flags — REALTEK_API SPI flash write-
+	 * protect register addresses + flags, plumbed through
+	 * RealtekISP::set_write_protect_pin in the original stack. The .upg's
+	 * param11/12/13 fields carry these (0x109B/0x223B/0x10001 for the
+	 * U4025QW DISPLAY); only the DISPLAY handler reads them. */
 	{
-		const gchar *flash_off_str =
-		    fu_dell_monitor_rt_firmware_component_get_field_string(
-			component,
-			FU_DELL_MONITOR_RT_FIRMWARE_FIELD_FLASH_OFF_OR_SIZE);
-		guint64 flash_off_val = 0;
-		if (flash_off_str != NULL &&
-		    fu_strtoull(flash_off_str,
-				&flash_off_val,
-				0,
-				0xFFFFFFFF,
-				FU_INTEGER_BASE_AUTO,
-				NULL))
-			route_out->flash_start_index = (guint32)flash_off_val;
+		guint64 v;
+		const gchar *s;
+
+		s = fu_dell_monitor_rt_firmware_component_get_field_string(
+		    component,
+		    FU_DELL_MONITOR_RT_FIRMWARE_FIELD_FLASH_OFF_OR_SIZE);
+		v = 0;
+		if (s != NULL &&
+		    fu_strtoull(s, &v, 0, 0xFFFFFFFF, FU_INTEGER_BASE_AUTO, NULL))
+			route_out->flash_start_index = (guint32)v;
+
+		s = fu_dell_monitor_rt_firmware_component_get_field_string(
+		    component,
+		    FU_DELL_MONITOR_RT_FIRMWARE_FIELD_FLASH_SIZE_OR_END);
+		v = 0;
+		if (s != NULL &&
+		    fu_strtoull(s, &v, 0, 0xFFFFFFFF, FU_INTEGER_BASE_AUTO, NULL))
+			route_out->flash_end_index = (guint32)v;
+
+		s = fu_dell_monitor_rt_firmware_component_get_field_string(
+		    component, FU_DELL_MONITOR_RT_FIRMWARE_FIELD_PARAM11);
+		v = 0;
+		if (s != NULL &&
+		    fu_strtoull(s, &v, 0, 0xFFFF, FU_INTEGER_BASE_AUTO, NULL))
+			route_out->wp_reg_a = (guint16)v;
+
+		s = fu_dell_monitor_rt_firmware_component_get_field_string(
+		    component, FU_DELL_MONITOR_RT_FIRMWARE_FIELD_PARAM12);
+		v = 0;
+		if (s != NULL &&
+		    fu_strtoull(s, &v, 0, 0xFFFF, FU_INTEGER_BASE_AUTO, NULL))
+			route_out->wp_reg_b = (guint16)v;
+
+		s = fu_dell_monitor_rt_firmware_component_get_field_string(
+		    component, FU_DELL_MONITOR_RT_FIRMWARE_FIELD_PARAM13);
+		v = 0;
+		if (s != NULL &&
+		    fu_strtoull(s, &v, 0, 0xFFFFFFFF, FU_INTEGER_BASE_AUTO, NULL))
+			route_out->chip_flags = (guint32)v;
 	}
 
 	if (usb_pid_str == NULL || i2c_str == NULL)
