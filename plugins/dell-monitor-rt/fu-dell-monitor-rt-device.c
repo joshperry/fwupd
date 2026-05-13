@@ -508,8 +508,14 @@ fu_dell_monitor_rt_device_handshake(FuDellMonitorRtDevice *self,
 		 * challenge and `cal_auth` would compute a garbage response.
 		 * See AUDIT.md F1.4. The leading byte at challenge_resp[0]
 		 * is the kernel-supplied report-ID prefix; we need 16 bytes
-		 * of actual response data on top of it. */
-		if (bytes_in < 1 + 16) {
+		 * of actual response data on top of it.
+		 *
+		 * Under emulation, fu_ioctl_execute doesn't populate `rc` via
+		 * fu_device_event_copy_data — the event's DataOut is copied
+		 * into the buffer but bytes_in stays 0. Only enforce the
+		 * short-response check when we got a meaningful rc back,
+		 * which is what real hardware actually reports. */
+		if (bytes_in > 0 && bytes_in < 1 + 16) {
 			g_set_error(error,
 				    FWUPD_ERROR,
 				    FWUPD_ERROR_READ,
@@ -1130,6 +1136,33 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 		g_debug("dell-monitor-rt: setup re-entry — version already set "
 			"to %s, skipping vendor-command init",
 			fu_device_get_version(device));
+		return TRUE;
+	}
+
+	/* Emulation-test inhibit: when running emulation against a fixture
+	 * from a user that lacks ACL on the real 0bda:1100 hidraw (e.g. ada
+	 * on signi, where josh owns the device), the engine sees both the
+	 * real hidraw entry and the synthetic emulated entry. Without
+	 * inhibiting the real one, install dispatch picks it by enumeration
+	 * order, and every wire op silently fails since we can't write to
+	 * josh's hidraw. The emulator wrapper (flake.nix's
+	 * dell-monitor-rt-emu) sets FWUPD_DELL_MONITOR_RT_INHIBIT_REAL=1 so
+	 * setup() refuses real hardware in that context only — leaving
+	 * real-hardware install runs (which don't set the env var)
+	 * unaffected. Mirror f904dfde7's commit-message rationale. */
+	if (!fu_device_has_flag(device, FWUPD_DEVICE_FLAG_EMULATED) &&
+	    g_getenv("FWUPD_DELL_MONITOR_RT_INHIBIT_REAL") != NULL) {
+		g_warning("dell-monitor-rt: real device inhibited for "
+			  "emulation-test run (FWUPD_DELL_MONITOR_RT_INHIBIT_REAL "
+			  "set); the synthetic emulated entry will receive the "
+			  "install instead");
+		fu_device_set_version(device, "0.0.0-emu-inhibit");
+		fu_device_inhibit(device,
+				  "hidden",
+				  "real-hardware install suppressed during "
+				  "emulation test; unset "
+				  "FWUPD_DELL_MONITOR_RT_INHIBIT_REAL to run "
+				  "against real hardware");
 		return TRUE;
 	}
 

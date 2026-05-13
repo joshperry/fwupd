@@ -197,7 +197,15 @@
           # that targets the pre-update version; --allow-reinstall lets
           # us replay even when the fixture's emulated device starts at
           # the same version the cab carries.
+          #
+          # FWUPD_DELL_MONITOR_RT_INHIBIT_REAL=1 tells the plugin's
+          # setup() to inhibit any real Dell U4025QW on the bus so the
+          # synthetic emulated device wins install dispatch. Without
+          # this, an emulation run from a user that lacks ACL on the
+          # real 0bda:1100 hidraw silently fails at the first vendor-
+          # command write — see f904dfde7 for the full rationale.
           echo "running emulation-load against $fixture"
+          export FWUPD_DELL_MONITOR_RT_INHIBIT_REAL=1
           exec "$MESON_BUILD_DIR/src/fwupdtool" emulation-load \
             "$fixture" "$cab" \
             --plugins dell_monitor_rt \
