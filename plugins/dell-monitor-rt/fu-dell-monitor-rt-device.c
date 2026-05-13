@@ -1728,6 +1728,73 @@ fu_dell_monitor_rt_pdc_finish_cmd(FuDellMonitorRtDevice *self,
 }
 
 /*
+ * Per-chunk verify helper. Reads the just-written chunk back via FLrd
+ * (in 16-byte halves, since the TPS6598x's reg-0x09 read window is
+ * 16 bytes wide) and byte-compares against the expected data. Up to
+ * `DELL_MONITOR_RT_PDC_VERIFY_RETRIES` retries on mismatch — matches
+ * Tps6598xISP::VerifyFW at libpdc.c:50046.
+ *
+ * Called per-chunk in pdc_program. Wistron always does this (their
+ * `using_verify_command_only` flag defaults to false); our previous
+ * implementation skipped it, trusting only the final FLvy hardware
+ * verify. We add it back as defense against silicon errata not
+ * documented in the public TI ref — Wistron presumably has a reason
+ * to belt-AND-suspenders this.
+ */
+#define DELL_MONITOR_RT_PDC_VERIFY_RETRIES 3
+#define DELL_MONITOR_RT_PDC_VERIFY_HALF    16 /* FLrd reads 16-byte halves */
+
+static gboolean
+fu_dell_monitor_rt_pdc_verify_chunk(FuDellMonitorRtDevice *self,
+				    guint32 addr,
+				    const guint8 *expected,
+				    gsize chunk_size,
+				    GError **error)
+{
+	guint8 readback[DELL_MONITOR_RT_PDC_CHUNK_SIZE] = {0};
+	guint retries = DELL_MONITOR_RT_PDC_VERIFY_RETRIES;
+
+	g_assert(chunk_size <= sizeof(readback));
+
+	while (retries > 0) {
+		for (gsize offset = 0; offset < chunk_size;
+		     offset += DELL_MONITOR_RT_PDC_VERIFY_HALF) {
+			guint32 cur_addr = addr + (guint32)offset;
+			guint8 addr_le[4] = {
+			    (guint8)(cur_addr & 0xFF),
+			    (guint8)((cur_addr >> 8) & 0xFF),
+			    (guint8)((cur_addr >> 16) & 0xFF),
+			    (guint8)((cur_addr >> 24) & 0xFF),
+			};
+			gsize to_read = MIN(DELL_MONITOR_RT_PDC_VERIFY_HALF,
+					    chunk_size - offset);
+			if (!fu_dell_monitor_rt_pdc_set_buf(self, addr_le, 4, error))
+				return FALSE;
+			if (!fu_dell_monitor_rt_pdc_cmd(self, "rd", error))
+				return FALSE;
+			if (!fu_dell_monitor_rt_pdc_finish_cmd(self,
+							       &readback[offset],
+							       to_read,
+							       error))
+				return FALSE;
+		}
+
+		if (memcmp(readback, expected, chunk_size) == 0)
+			return TRUE;
+
+		retries--;
+	}
+
+	g_set_error(error,
+		    FWUPD_ERROR,
+		    FWUPD_ERROR_INVALID_DATA,
+		    "PDC chunk verify failed at flash 0x%08x after %u retries",
+		    addr,
+		    (guint)DELL_MONITOR_RT_PDC_VERIFY_RETRIES);
+	return FALSE;
+}
+
+/*
  * Phase A driver — program the TPS6598x SPI flash with the PDC
  * firmware blob via the 4CC command interface.
  *
@@ -1762,10 +1829,15 @@ fu_dell_monitor_rt_pdc_finish_cmd(FuDellMonitorRtDevice *self,
  *   1. FLrr(R0)              — discover Region 0's flash base address
  *   2. FLem(base, ceil(blob_size / 4096))  — erase enough sectors
  *   3. For each chunk of `blob` from offset chunk_size onwards:
- *        FLad(base + offset) → FLwd(chunk)
- *   4. FLad(base) + FLwd(blob[0:chunk_size]) — header-last commit
+ *        FLad(base + offset) → FLwd(chunk) → 2× FLrd(verify in halves)
+ *   4. FLad(base) + FLwd(blob[0:chunk_size]) → 2× FLrd — header-last commit
  *   5. FLrr(R0) again        — re-read region pointer (Wistron's pattern)
  *   6. FLvy(base)            — verify the entire region
+ *
+ * The per-chunk FLrd readback in step 3 mirrors Tps6598xISP::VerifyFW
+ * (libpdc.c:50046). It's redundant with the chip's own FLvy command in
+ * step 6, but Wistron does both — and we don't have visibility into
+ * silicon errata that would justify trusting FLvy alone, so we don't.
  *
  * Portability notes:
  *   - Sector size hardcoded to 4 KB per the TPS6598x spec; if a
@@ -1914,6 +1986,14 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 			return FALSE;
 		if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
 			return FALSE;
+
+		/* Per-chunk readback verify (matches Wistron's VerifyFW). */
+		if (!fu_dell_monitor_rt_pdc_verify_chunk(self,
+							 addr,
+							 src,
+							 DELL_MONITOR_RT_PDC_CHUNK_SIZE,
+							 error))
+			return FALSE;
 		if (progress != NULL)
 			fu_progress_step_done(progress);
 	}
@@ -1934,6 +2014,14 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 		if (!fu_dell_monitor_rt_pdc_cmd(self, "wd", error))
 			return FALSE;
 		if (!fu_dell_monitor_rt_pdc_finish_cmd(self, NULL, 0, error))
+			return FALSE;
+
+		/* Verify the header chunk too. */
+		if (!fu_dell_monitor_rt_pdc_verify_chunk(self,
+							 base,
+							 blob_data,
+							 DELL_MONITOR_RT_PDC_CHUNK_SIZE,
+							 error))
 			return FALSE;
 	}
 	if (progress != NULL)
