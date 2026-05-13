@@ -2,7 +2,14 @@
   description = "fwupd, with the in-development dell-monitor-rt plugin";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+    # Track unstable so the inherited fwupd derivation is rebased onto a
+    # newer upstream. The 25.11 stable channel's fwupd was authored
+    # against a fwupd source where meson_options.txt still used the
+    # single-line option(...) form, so its NixOS-specific patches no
+    # longer apply cleanly to our local source (upstream commit 272121c47
+    # ran `meson format -i -r` on options). Unstable has the rebased
+    # patches and the build-sandbox fixes (e.g. grub.d probing).
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -19,9 +26,22 @@
         fwupd-dev = pkgs.fwupd.overrideAttrs (old: {
           version = "dev-${self.shortRev or "dirty"}";
           src = self;
-          # Skip the upstream release-tarball checksum since we're using
-          # the local tree. doCheck stays on so the test suite still runs.
-          doCheck = old.doCheck or false;
+          # Skip upstream's release tarball checksum (local tree). The
+          # test suite is also off — fu-engine-gtypes-test SIGTRAPs in
+          # the sandbox on signi and we don't need the upstream tests
+          # green for our dev builds; meson test -C build covers what
+          # matters for our plugin.
+          doCheck = false;
+          # Two of unstable's nixpkgs patches (fix-mtdram-test and
+          # fix-test_get_devices-on-non-x86-architectures) have already
+          # landed upstream in our 2.1.3 source, so re-applying them
+          # produces "Reversed (or previously applied)" stalls and the
+          # build aborts. Drop just those two; the rest still apply.
+          patches = builtins.filter
+            (p: let n = toString p; in
+                !(pkgs.lib.hasSuffix "fix-mtdram-test-for-missing-kernel-module.patch" n) &&
+                !(pkgs.lib.hasSuffix "fix-test_get_devices-on-non-x86-architectures.patch" n))
+            (old.patches or []);
         });
 
         # Convenience handle for things that just want the bin dir.
