@@ -1024,6 +1024,146 @@ fu_dell_monitor_rt_device_read_panel_id(FuDellMonitorRtDevice *self,
 }
 
 /*
+ * Commit a marked IspTag string ("#<marker>#<version>#") to the chip
+ * via VCP 0xAD over DDC/CI. The chip uses IspTag as both an "intent
+ * announcement" channel (marker = "ISP" at install start) and a "now
+ * verify what I just programmed" trigger (marker = "CHK" after a
+ * staged firmware completes).
+ *
+ * Wire format (28 bytes total on slave 0x6e):
+ *
+ *   byte 0:  0x51                source = host
+ *   byte 1:  0x99                DDC/CI length byte = 0x80 | 25
+ *   byte 2:  0xc0                opcode (proprietary)
+ *   byte 3:  0x55                sub-op = WRITE
+ *   byte 4:  0xad                VCP code = IspTag
+ *   bytes 5..26:  "#<marker>#<version>#" + zero padding to 22 bytes
+ *   byte 27: XOR checksum (includes i2c dest addr 0x6e)
+ *
+ * Pcap evidence in
+ * captures/u4025qw-update-recap-20260502-185321.pcapng:
+ *
+ *   Frame  7230: "#ISP#M3T105#"   — pre-install announcement #1
+ *   Frame  7264: "#ISP#M3T105#"   — pre-install announcement #2 (Wistron
+ *                                  emits two identical writes back-to-back;
+ *                                  defensive or paired-protocol, we just
+ *                                  mirror)
+ *   Frame 290306: "#CHK#M3T105#"  — post-PDC commit, triggers chip-side
+ *                                  signature verification of the staged
+ *                                  PDC firmware. Without this the chip
+ *                                  STALLs DISPLAY block 0's
+ *                                  secure_control_gpio commit because the
+ *                                  PDC sits unverified in the spare bank.
+ *
+ * Decompiled source: firmware-updater.c FUN_00317d00 calls
+ * vtable[0x1a0]("IspTag", str) after the per-chip program call returns
+ * success. The string is built as "#CHK#" + <version> + "#" — same
+ * shape as the parallel FUN_00317400 which uses "#ISP#".
+ *
+ * marker_3:   exactly 3 chars, "ISP" or "CHK".
+ * version:    the .upg's top-level FIELD_VERSION (e.g., "M3T105"). Limited
+ *             to 16 chars by the 28-byte wire envelope.
+ */
+static gboolean
+fu_dell_monitor_rt_device_commit_isp_tag(FuDellMonitorRtDevice *self,
+					 const gchar *marker_3,
+					 const gchar *version,
+					 GError **error)
+{
+	guint8 wire[28] = {0};
+	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	guint8 hub_key[8];
+	gsize version_len;
+	gsize off;
+	guint8 chk;
+
+	g_return_val_if_fail(marker_3 != NULL && strlen(marker_3) == 3, FALSE);
+	g_return_val_if_fail(version != NULL, FALSE);
+
+	version_len = strlen(version);
+	/* Payload after byte 4: "#" + 3 + "#" + version_len + "#" + zero padding;
+	 * must fit in bytes 5..26 (22 bytes available). */
+	if (3 + 3 + version_len > 22) {
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_INVALID_DATA,
+			    "version too long for IspTag VCP write: %" G_GSIZE_FORMAT,
+			    version_len);
+		return FALSE;
+	}
+
+	/* Header */
+	wire[0] = 0x51; /* source = host */
+	wire[1] = 0x99; /* 0x80 | 25 (length) */
+	wire[2] = 0xc0; /* opcode */
+	wire[3] = 0x55; /* sub = WRITE */
+	wire[4] = 0xad; /* VCP code = IspTag */
+	/* Payload "#<marker>#<version>#" starting at byte 5 */
+	off = 5;
+	wire[off++] = '#';
+	memcpy(&wire[off], marker_3, 3);
+	off += 3;
+	wire[off++] = '#';
+	memcpy(&wire[off], version, version_len);
+	off += version_len;
+	wire[off++] = '#';
+	/* bytes off..26 stay zero (padding) */
+
+	/* Checksum: XOR of dest addr 0x6e + all 27 preceding bytes */
+	chk = DELL_MONITOR_RT_I2C_TARGET_DDCCI;
+	for (gsize i = 0; i < 27; i++)
+		chk ^= wire[i];
+	wire[27] = chk;
+
+	/* Per-write cal_auth handshake — same pattern as read_panel_id /
+	 * read_isp_tag. The chip gates DDC/CI ops on a fresh challenge. */
+	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+				      hub_key);
+	if (!fu_dell_monitor_rt_device_handshake(self, hub_key, error)) {
+		g_prefix_error(error,
+			       "IspTag #%s#%s# commit handshake: ",
+			       marker_3,
+			       version);
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_i2c_write(self,
+						 DELL_MONITOR_RT_I2C_TARGET_DDCCI,
+						 wire,
+						 sizeof(wire),
+						 error)) {
+		g_prefix_error(error,
+			       "IspTag #%s#%s# write: ",
+			       marker_3,
+			       version);
+		return FALSE;
+	}
+	/* Settle delay matches the cadence in the recap (~50 ms between
+	 * write and response read for our existing read_panel_id /
+	 * read_isp_tag pairs). */
+	g_usleep(50 * 1000);
+	/* Drain the chip's 64-byte response. We don't validate the
+	 * contents — without decoding the response format we'd rather
+	 * not gate the install on bytes we don't understand. The read
+	 * is required because Wistron always does it and the chip's
+	 * i2c-tunnel state machine may stall future ops if the response
+	 * stays queued. */
+	if (!fu_dell_monitor_rt_device_i2c_read(self,
+						DELL_MONITOR_RT_I2C_TARGET_DDCCI,
+						0x40,
+						response,
+						sizeof(response),
+						error)) {
+		g_prefix_error(error,
+			       "IspTag #%s#%s# response drain: ",
+			       marker_3,
+			       version);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
  * verify_baseline — pre-flash panel-binding check that runs before any
  * device IO that mutates state.
  *
@@ -4373,6 +4513,7 @@ fu_dell_monitor_rt_proto_pdc_stage(FuDellMonitorRtDevice *target,
 				   GError **error)
 {
 	guint8 hub_key[8];
+	const gchar *install_version;
 
 	(void)route; /* slave 0x42 is implicit in pdc_program */
 	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
@@ -4380,7 +4521,33 @@ fu_dell_monitor_rt_proto_pdc_stage(FuDellMonitorRtDevice *target,
 				      hub_key);
 	if (!fu_dell_monitor_rt_device_handshake(target, hub_key, error))
 		return FALSE;
-	return fu_dell_monitor_rt_device_pdc_program(target, blob, NULL, error);
+	if (!fu_dell_monitor_rt_device_pdc_program(target, blob, NULL, error))
+		return FALSE;
+
+	/* Post-PDC commit: write "#CHK#<install_version>#" to VCP 0xAD.
+	 * This triggers the chip's signature verification of the just-
+	 * staged PDC firmware (recap frame 290306). Without it, DISPLAY
+	 * block 0's 0x04 secure_control_gpio commit STALLs because the
+	 * chip refuses to enable the secure flash GPIO while an
+	 * unverified PDC sits in the spare bank. The install_version
+	 * was cached on the device by write_firmware. */
+	install_version =
+	    fu_device_get_metadata(FU_DEVICE(target),
+				   "dell-monitor-rt:install-version");
+	if (install_version != NULL) {
+		if (!fu_dell_monitor_rt_device_commit_isp_tag(target,
+							      "CHK",
+							      install_version,
+							      error)) {
+			g_prefix_error(error, "post-PDC IspTag commit: ");
+			return FALSE;
+		}
+	} else {
+		g_warning("dell-monitor-rt: post-PDC commit skipped — no "
+			  "install-version metadata cached (write_firmware "
+			  "should have set it)");
+	}
+	return TRUE;
 }
 
 /*
@@ -4818,6 +4985,22 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		       pre_bl_done ? "post-bootloader" : "pre-bootloader");
 	}
 
+	/* Cache the new firmware's top-level version string on the device.
+	 * proto_pdc_stage (iteration 2) needs it for the post-PDC #CHK#
+	 * commit. Re-set on every write_firmware call rather than carrying
+	 * across the replug — fwupd's device replace doesn't copy metadata
+	 * by default, but we get the same FuFirmware passed to every
+	 * iteration so we can just refresh the cache here. */
+	{
+		const gchar *new_version =
+		    fu_dell_monitor_rt_firmware_get_fw_version(fw_container);
+		if (new_version != NULL) {
+			fu_device_set_metadata(device,
+					       "dell-monitor-rt:install-version",
+					       new_version);
+		}
+	}
+
 	/* Open every paired child device for the duration of write_firmware.
 	 * fwupd's engine only opens the device it's actively flashing (the
 	 * primary parent here); when our route walker dispatches a stage to
@@ -4899,6 +5082,40 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 		} else {
 			pass_lo = 0;
 			pass_hi = DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES;
+
+			/* Pre-install IspTag announcement (iteration 1 only).
+			 * Wistron writes "#ISP#<new_version>#" to VCP 0xAD
+			 * twice back-to-back before any flashing begins
+			 * (recap frames 7230 and 7264). This tells the chip
+			 * the target version of the in-progress update so it
+			 * can later verify the staged firmware against it
+			 * when "#CHK#<new_version>#" arrives post-PDC.
+			 * Without this pair the chip rejects the post-PDC
+			 * commit and stalls DISPLAY block 0. The duplicate
+			 * write matches Wistron's exact emission pattern —
+			 * defensive or paired-protocol, unclear, but cheap
+			 * to mirror. */
+			{
+				const gchar *new_version =
+				    fu_dell_monitor_rt_firmware_get_fw_version(
+					fw_container);
+				if (new_version != NULL) {
+					for (guint k = 0; k < 2; k++) {
+						if (!fu_dell_monitor_rt_device_commit_isp_tag(
+							self,
+							"ISP",
+							new_version,
+							error)) {
+							g_prefix_error(
+							    error,
+							    "pre-install IspTag "
+							    "announcement #%u: ",
+							    k + 1);
+							return FALSE;
+						}
+					}
+				}
+			}
 		}
 		for (guint pass = pass_lo; pass < pass_hi; pass++) {
 			components = fu_firmware_get_images(firmware);
