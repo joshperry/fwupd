@@ -4121,6 +4121,21 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 			return FALSE;
 	}
 
+	/* The install drops the firmware-mode HID interface multiple times
+	 * (the 0xE9 BOOTLOADER_ENTER triggers fired below cycle the MCU
+	 * FW→BL→FW→BL→FW). After write_firmware returns, fwupd's reload
+	 * phase needs to find the device back on the bus to verify the
+	 * install succeeded. Setting WAIT_FOR_REPLUG asks the engine to
+	 * pause at the end of write_firmware until the device disappears
+	 * and re-appears (or remove_delay elapses — 60s in our init).
+	 *
+	 * The pcap shows no version-confirm reads against the post-update
+	 * device beyond the re-enumeration handshake itself, so we don't
+	 * override device_class->reload — the default no-op success is
+	 * the right answer here. The flag is the only piece of reload-
+	 * phase machinery we need to invoke. */
+	fu_device_add_flag(device, FWUPD_DEVICE_FLAG_WAIT_FOR_REPLUG);
+
 	/* Track which (target, proto) pairs have been armed. Keys are
 	 * "<device-id>|<proto-name>" strings. Hash table owns the keys. */
 	{

@@ -487,6 +487,35 @@ def _is_first_install_marker(event: Dict[str, Any]) -> bool:
     )
 
 
+def _split_at_final_bootloader_enter(
+    events: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Partition install-phase events into (pre-reload, reload) at the
+    LAST 0xE9 bootloader-enter trigger.
+
+    Wistron's update fires the trigger four times in the captured trace:
+    once each at the end of Phase A pre-flash, Phase A post-flash, Phase
+    B pre-flash, and Phase B post-flash. The fourth is what kicks the
+    device into the post-update firmware mode and triggers the final
+    USB re-enumeration. Events captured after that final 0xE9 — the
+    re-enum descriptor exchange and any post-update HID polling — are
+    what should drive fwupd's reload phase.
+
+    The trigger itself goes into pre-reload (install.json) because
+    that's where our write_firmware emits it. Reload-phase events are
+    everything captured after the trigger.
+
+    If fewer than four triggers are found (e.g. a trace that's missing
+    a phase), returns (events, []) so we don't accidentally route
+    install-phase work into reload.json.
+    """
+    boundaries = [i for i, ev in enumerate(events) if _is_bootloader_enter(ev)]
+    if len(boundaries) < 4:
+        return list(events), []
+    cut = boundaries[3] + 1  # everything after the 4th trigger
+    return events[:cut], events[cut:]
+
+
 def _split_at_install_start(
     events: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -589,16 +618,33 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
     #     side.
     setup_devs: List[Dict[str, Any]] = []
     install_devs: List[Dict[str, Any]] = []
+    reload_devs: List[Dict[str, Any]] = []
     for dev in flat_devices:
         pid = dev.get("IdProduct", 0)
         if pid == PRIMARY_PID:
-            setup_evs, install_evs = _split_at_install_start(dev["Events"])
+            setup_evs, post_setup = _split_at_install_start(dev["Events"])
+            install_evs, reload_evs = _split_at_final_bootloader_enter(
+                post_setup
+            )
             setup_dev = {k: v for k, v in dev.items() if k != "Events"}
             setup_dev["Events"] = setup_evs
             setup_devs.append(setup_dev)
             install_dev = {k: v for k, v in dev.items() if k != "Events"}
             install_dev["Events"] = install_evs
             install_devs.append(install_dev)
+            # Reload-phase events stay on the same UsbDevice entry —
+            # same BackendId, same Created. The emulator's backend
+            # matches by (backend_id, created_usec) and treats a hit
+            # as a device-changed signal rather than a device-add,
+            # which preserves our FuDevice instance (and its cached
+            # panel_id) across the phase boundary. The matcher cursor
+            # walks past the install-phase event list and wraps to 0
+            # for the reload events at the next read (fu-device.c
+            # "no more events, looping" path).
+            if reload_evs:
+                reload_dev = {k: v for k, v in dev.items() if k != "Events"}
+                reload_dev["Events"] = reload_evs
+                reload_devs.append(reload_dev)
         else:
             # Child: full event stream in setup.json only.
             setup_dev = {k: v for k, v in dev.items() if k != "Events"}
@@ -607,11 +653,7 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
 
     setup_phase = _build_phase(setup_devs)
     install_phase = _build_phase(install_devs)
-    # No reload events recovered from the wire trace yet — leave the phase
-    # empty so the engine doesn't try to replay against it. The
-    # post-flash version probe captured in the pcap's phase 7+ would slot
-    # in here once we wire reload events into the plugin's reload path.
-    reload_phase = _build_phase([])
+    reload_phase = _build_phase(reload_devs)
 
     with ZipFile(output_zip, "w", compression=ZIP_DEFLATED) as out:
         out.writestr(
@@ -626,7 +668,11 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
         )
 
     # Diagnostic summary
-    for name, phase in [("setup", setup_phase), ("install", install_phase)]:
+    for name, phase in [
+        ("setup", setup_phase),
+        ("install", install_phase),
+        ("reload", reload_phase),
+    ]:
         for dev in phase["UsbDevices"]:
             n_writes = sum(
                 1 for e in dev["Events"] if e.get("Id", "").startswith("Write:")
