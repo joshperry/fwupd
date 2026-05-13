@@ -57,8 +57,10 @@ from zipfile import ZipFile, ZIP_DEFLATED
 
 # Realtek RTS5409S hub MCU on the Dell U4025QW exposes two HID interfaces:
 #   - VID:PID 0bda:1100 — primary, runs the cal_auth + I²C tunnel + flash
-#   - VID:PID 0bda:1101 — secondary; not currently driven by the plugin
+#   - VID:PID 0bda:1101 — secondary; HUB4 c8 staging happens here, driven
+#                          by the primary's plugin code via target redirect
 DELL_MONITOR_RT_VID_PID = ["0bda:1100", "0bda:1101"]
+PRIMARY_PID = 0x1100
 
 # Bootloader-entry trigger — opcode 0xE9 sent twice on each firmware-mode
 # HID interface immediately before the device drops the firmware-mode
@@ -454,6 +456,65 @@ def _flatten_devices(
     return [by_backend_id[bid] for bid in order]
 
 
+def _is_first_install_marker(event: Dict[str, Any]) -> bool:
+    """The first event that's clearly part of "install execution" rather
+    than "info-display probes" — the first chunked HUB1 staging write
+    (i2c-W slave=0xd4 count=66). Wistron's tool spends pcap phase 1's
+    first ~320 events doing info reads (panel id, asset tag, model,
+    firmware version, IspTag, hub status, PDC version) before this
+    chunked write fires; that's the natural boundary between
+    fwupd-setup-equivalent activity and fwupd-install-equivalent activity.
+
+    Post-prefix layout (events here have already passed through
+    _add_report_id_prefix): byte 0 is the leading 0x00 prefix, then
+    direction at 1, opcode at 2, count at 7, slave at 9."""
+    eid = event.get("Id", "")
+    if not eid.startswith("Write:Data="):
+        return False
+    data_b64 = eid.split("Data=", 1)[1].split(",")[0]
+    try:
+        d = base64.b64decode(data_b64)
+    except Exception:
+        return False
+    if len(d) < 12:
+        return False
+    return (
+        d[0] == HIDRAW_REPORT_ID_PREFIX
+        and d[1] == 0x40
+        and d[2] == 0xC6
+        and d[7] == 66
+        and d[9] == 0xD4
+    )
+
+
+def _split_at_install_start(
+    events: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Partition a device's events into (setup, install).
+
+    Setup events: structural enumeration probes + the leading info-display
+    wire activity that Wistron's tool runs before any chip programming.
+    This covers what our plugin's setup() and pre-write_firmware lifecycle
+    consume — version reads, panel id reads, hub/PDC status reads, etc.
+    The events live in pcap phase 1 alongside install events, and we
+    can't trivially distinguish them by event type alone.
+
+    Install events: from the first chunked HUB1 staging write onward.
+    That's the first event in the captured trace that's clearly part of
+    install-execution rather than info-display.
+
+    If no install marker is found (e.g., a child device that has no
+    HUB1 activity), all events go to setup.
+    """
+    boundary = next(
+        (i for i, ev in enumerate(events) if _is_first_install_marker(ev)),
+        None,
+    )
+    if boundary is None:
+        return list(events), []
+    return events[:boundary], events[boundary:]
+
+
 def _build_phase(devices: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"FwupdVersion": "2.0.0", "UsbDevices": devices}
 
@@ -482,32 +543,67 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
     for dev in flat_devices:
         dev["Events"] = _normalize_pdc_setbufs(dev["Events"])
 
-    # Step 3: emit every device's full event stream into BOTH setup.json
-    # and install.json. The earlier pre/post-trigger split was elegant
-    # but didn't survive multi-device fixtures: fwupd's emulator only
-    # reloads install.json events for devices the engine *explicitly*
-    # fetches via fu_engine_get_device, and child devices that the
-    # primary's write_firmware drives in-place are never fetched —
-    # their setup.json events stay loaded across phases. So if their
-    # bootloader-entry / post-trigger events live only in install.json,
-    # the primary's call into the child fails with "no event with ID
-    # 0xE9" because the child never sees those events.
+    # Step 3: split each device's flattened stream into setup vs install
+    # events, respecting fwupd's per-device emulation-load reload semantics.
     #
-    # Putting the full stream in both phases makes the child's events
-    # available regardless of which phase loaded last, at the cost of
-    # duplicated event blobs in the fixture zip (zip dedup compresses
-    # most of it back). Cursor advancement is monotonic per device, so
-    # carrying the cursor across the phase reload is fine — the
-    # plugin's writes keep matching forward through the same stream.
+    # Why a split, not a dump-to-both:
+    #
+    # fwupd's emulator appends a phase's events into the device's events
+    # list when that phase is loaded — without clearing prior phases. So
+    # if setup.json and install.json contain identical full-trace dumps
+    # (the previous design here), the device's events list grows to ~2×
+    # the trace size at install time. The matcher's cursor — which is per-
+    # device but persists across phases — finds itself at position N (where
+    # N is wherever setup() consumed up to), and any install-time read of
+    # an event that lived early in the trace forces the matcher to scan
+    # forward past the entire setup-phase copy of the events to reach the
+    # install-phase copy. For our verify_baseline panel-id read this was
+    # ~222k events bypassed silently — 99.9% of the recorded protocol.
+    # That's not a small amount of "fixture noise"; it's the matcher
+    # silently leapfrogging over almost the entire captured Wistron run.
+    #
+    # The split below puts each event in exactly one phase's events list,
+    # so the matcher walks through one continuous stream that grows by
+    # the install-phase events at install time, not by a duplicate copy
+    # of everything. The plugin's emit order has to match the trace's
+    # capture order monotonically, but that's the goal — the emulator
+    # trace should converge on the pcap as we learn the protocol.
+    #
+    # Per-device split rules:
+    #
+    #   Primary device (PID 0x1100): structural enumeration events
+    #     (GetBackendParent / ReadProp / ReadSysfs at the head of the
+    #     event stream) go to setup.json — fwupd's setup() phase needs
+    #     them to construct the device. All subsequent wire events
+    #     (Write / Ioctl) go to install.json — they're consumed during
+    #     write_firmware().
+    #
+    #   Child devices (PID 0x1101 in our case): all events go to
+    #     setup.json. fwupd doesn't reload child-device event lists
+    #     between phases — when the primary's write_firmware drives
+    #     a child via target redirect, the matcher is still using
+    #     events that were loaded at setup time. So child events have
+    #     to be present at setup time to be available at install time.
+    #     This is the original workaround the previous full-dump design
+    #     was solving for; we preserve it here while fixing the primary
+    #     side.
     setup_devs: List[Dict[str, Any]] = []
     install_devs: List[Dict[str, Any]] = []
     for dev in flat_devices:
-        setup_dev = {k: v for k, v in dev.items() if k != "Events"}
-        setup_dev["Events"] = list(dev.get("Events", []))
-        setup_devs.append(setup_dev)
-        install_dev = {k: v for k, v in dev.items() if k != "Events"}
-        install_dev["Events"] = list(dev.get("Events", []))
-        install_devs.append(install_dev)
+        pid = dev.get("IdProduct", 0)
+        if pid == PRIMARY_PID:
+            setup_evs, install_evs = _split_at_install_start(dev["Events"])
+            setup_dev = {k: v for k, v in dev.items() if k != "Events"}
+            setup_dev["Events"] = setup_evs
+            setup_devs.append(setup_dev)
+            install_dev = {k: v for k, v in dev.items() if k != "Events"}
+            install_dev["Events"] = install_evs
+            install_devs.append(install_dev)
+        else:
+            # Child: full event stream in setup.json only.
+            setup_dev = {k: v for k, v in dev.items() if k != "Events"}
+            setup_dev["Events"] = list(dev.get("Events", []))
+            setup_devs.append(setup_dev)
 
     setup_phase = _build_phase(setup_devs)
     install_phase = _build_phase(install_devs)
