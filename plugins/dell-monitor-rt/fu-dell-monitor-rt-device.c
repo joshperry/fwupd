@@ -583,6 +583,92 @@ fu_dell_monitor_rt_device_handshake(FuDellMonitorRtDevice *self,
 }
 
 /*
+ * I²C-tunnel session open / close — the per-command framing every
+ * DDC/CI op in Wistron's flow gets wrapped with. Each command arrives
+ * as:
+ *
+ *   session_open()
+ *     enable_vdcmd        (op=0x02 sub=1, vendor sig 'DA 0B' payload)
+ *     enable_high_clock   (op=0x06 sub=1)
+ *     handshake           (cal_auth challenge req + resp read + resp write)
+ *   <the actual command + its response read>
+ *   session_close()
+ *     handshake           (cal_auth re-issued — closes the session)
+ *     disable_high_clock  (op=0x06 sub=0)
+ *
+ * The chip's i2c-tunnel state machine treats high_clock_mode disable
+ * as the session-end signal. Sending an op while a previous session
+ * is still open works for innocuous reads but causes the chip to
+ * STALL security-sensitive ops like DISPLAY's secure_control_gpio
+ * (0x04) — the chip refuses to enable the secure flash GPIO without
+ * a fresh authenticated session. Real-hardware failure traced in
+ * captures/u4025qw-failrun-20260513-161520.pcapng.
+ *
+ * Decoded from the recap pcap by walking every "skipped events"
+ * entry the emulator reported between our DDC/CI ops; the same 6-
+ * event close+open pattern brackets every recap DDC/CI command on
+ * slaves 0x6e (DDC/CI) and 0x94 (panel scaler).
+ */
+static gboolean
+fu_dell_monitor_rt_device_session_open(FuDellMonitorRtDevice *self,
+				       const guint8 hub_key[8],
+				       GError **error)
+{
+	const guint8 vendor_sig[2] = {DELL_MONITOR_RT_VENDOR_SIG_LO,
+				      DELL_MONITOR_RT_VENDOR_SIG_HI};
+	if (!fu_dell_monitor_rt_device_vcmd(self,
+					    DELL_MONITOR_RT_DIR_WRITE,
+					    DELL_MONITOR_RT_OPCODE_ENABLE_VDCMD,
+					    0x01, /* sub = enable */
+					    0x00,
+					    vendor_sig,
+					    sizeof(vendor_sig),
+					    error)) {
+		g_prefix_error(error, "session_open enable_vdcmd: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_vcmd(self,
+					    DELL_MONITOR_RT_DIR_WRITE,
+					    DELL_MONITOR_RT_OPCODE_ENABLE_HIGH_CLOCK,
+					    0x01, /* sub = enable */
+					    0x00,
+					    NULL,
+					    0,
+					    error)) {
+		g_prefix_error(error, "session_open enable_high_clock: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_handshake(self, hub_key, error)) {
+		g_prefix_error(error, "session_open handshake: ");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static gboolean
+fu_dell_monitor_rt_device_session_close(FuDellMonitorRtDevice *self,
+					const guint8 hub_key[8],
+					GError **error)
+{
+	if (!fu_dell_monitor_rt_device_handshake(self, hub_key, error)) {
+		g_prefix_error(error, "session_close handshake: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_vcmd(self,
+					    DELL_MONITOR_RT_DIR_WRITE,
+					    DELL_MONITOR_RT_OPCODE_ENABLE_HIGH_CLOCK,
+					    0x00, /* sub = disable */
+					    0x00,
+					    NULL,
+					    0,
+					    error)) {
+		g_prefix_error(error, "session_close disable_high_clock: ");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
  * Send an I²C-tunnel WRITE through the HID transport (opcode 0xC6).
  * Layout decoded from RTS5409S_HID::write in libdevices.so:
  *
@@ -1115,14 +1201,17 @@ fu_dell_monitor_rt_device_commit_isp_tag(FuDellMonitorRtDevice *self,
 		chk ^= wire[i];
 	wire[27] = chk;
 
-	/* Per-write cal_auth handshake — same pattern as read_panel_id /
-	 * read_isp_tag. The chip gates DDC/CI ops on a fresh challenge. */
+	/* session_open + command + response read + session_close — Wistron
+	 * brackets every DDC/CI command with this template; skipping the
+	 * close left the chip in a stale-session state and broke DISPLAY's
+	 * 0x04 secure_control_gpio commit. See session_open() for the full
+	 * decoded sequence. */
 	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
 				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
 				      hub_key);
-	if (!fu_dell_monitor_rt_device_handshake(self, hub_key, error)) {
+	if (!fu_dell_monitor_rt_device_session_open(self, hub_key, error)) {
 		g_prefix_error(error,
-			       "IspTag #%s#%s# commit handshake: ",
+			       "IspTag #%s#%s# session_open: ",
 			       marker_3,
 			       version);
 		return FALSE;
@@ -1162,6 +1251,13 @@ fu_dell_monitor_rt_device_commit_isp_tag(FuDellMonitorRtDevice *self,
 						error)) {
 		g_prefix_error(error,
 			       "IspTag #%s#%s# response drain: ",
+			       marker_3,
+			       version);
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_session_close(self, hub_key, error)) {
+		g_prefix_error(error,
+			       "IspTag #%s#%s# session_close: ",
 			       marker_3,
 			       version);
 		return FALSE;
@@ -4597,17 +4693,37 @@ fu_dell_monitor_rt_proto_display_stage(FuDellMonitorRtDevice *target,
 	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
 				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
 				      hub_key);
-	if (!fu_dell_monitor_rt_device_handshake(target, hub_key, error))
+	/* Open a fresh i2c-tunnel session for the entire DISPLAY phase
+	 * (rtkpanel_setup + per-block loop + validity marker). The whole
+	 * sequence runs in one session per the recap pcap — no
+	 * intervening session_close until display_program completes.
+	 * Without the session_open here the chip rejects the 0x04
+	 * secure_control_gpio commit on block 0 with EPIPE. */
+	if (!fu_dell_monitor_rt_device_session_open(target, hub_key, error)) {
+		g_prefix_error(error, "DISPLAY session_open: ");
 		return FALSE;
-	return fu_dell_monitor_rt_device_display_program(target,
-							 blob,
-							 route->flash_start_index,
-							 route->flash_end_index,
-							 route->wp_reg_a,
-							 route->wp_reg_b,
-							 route->chip_flags,
-							 NULL,
-							 error);
+	}
+	if (!fu_dell_monitor_rt_device_display_program(target,
+						       blob,
+						       route->flash_start_index,
+						       route->flash_end_index,
+						       route->wp_reg_a,
+						       route->wp_reg_b,
+						       route->chip_flags,
+						       NULL,
+						       error)) {
+		/* Best-effort close on failure path so the chip isn't
+		 * left with a dangling open session. Ignore close errors
+		 * since the original failure is the user-visible one. */
+		g_autoptr(GError) ignored = NULL;
+		fu_dell_monitor_rt_device_session_close(target, hub_key, &ignored);
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_session_close(target, hub_key, error)) {
+		g_prefix_error(error, "DISPLAY session_close: ");
+		return FALSE;
+	}
+	return TRUE;
 }
 
 /*
