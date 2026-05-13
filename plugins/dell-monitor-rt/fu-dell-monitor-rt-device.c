@@ -1297,6 +1297,12 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 	return TRUE;
 }
 
+/* Private flag — set on the device at the end of pre-bootloader work
+ * so the next write_firmware iteration knows to run the post-bootloader
+ * passes instead of re-running pre-BL. Survives device replacement on
+ * USB re-enumeration via the device_class->replace override. */
+#define FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE "pre-bl-done"
+
 static void
 fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 {
@@ -1312,6 +1318,46 @@ fu_dell_monitor_rt_device_init(FuDellMonitorRtDevice *self)
 				     FU_IO_CHANNEL_OPEN_FLAG_READ);
 	fu_udev_device_add_open_flag(FU_UDEV_DEVICE(self),
 				     FU_IO_CHANNEL_OPEN_FLAG_WRITE);
+	fu_device_register_private_flag(FU_DEVICE(self),
+					FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE);
+}
+
+/*
+ * Copy the install-phase tracking flag from the donor (pre-replug) device
+ * to this (post-replug) device. Called by the engine's device-list
+ * replace path whenever a new FuDevice is detected for the same backend_id
+ * — which is exactly what happens after the 0xE9 bootloader-enter
+ * trigger forces a USB re-enumeration. Without this, the post-replug
+ * device starts fresh with no flag set and write_firmware would loop
+ * back into pre-bootloader work.
+ */
+static void
+fu_dell_monitor_rt_device_replace(FuDevice *device, FuDevice *donor)
+{
+	if (fu_device_has_private_flag(donor,
+				       FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE)) {
+		fu_device_add_private_flag(device,
+					   FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE);
+	}
+}
+
+/*
+ * Clear install-phase state when the install completes (success or
+ * failure). Without this, a failed install leaves the flag set and a
+ * subsequent retry would jump straight to post-bootloader work without
+ * re-doing the pre-BL flashing.
+ */
+static gboolean
+fu_dell_monitor_rt_device_cleanup(FuDevice *device,
+				  FuProgress *progress,
+				  FwupdInstallFlags flags,
+				  GError **error)
+{
+	(void)progress;
+	(void)flags;
+	(void)error;
+	fu_device_remove_private_flag(device, FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE);
+	return TRUE;
 }
 
 /*
@@ -4736,6 +4782,42 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 	 * phase machinery we need to invoke. */
 	fu_device_add_flag(device, FWUPD_DEVICE_FLAG_WAIT_FOR_REPLUG);
 
+	/* Multi-phase install: the chip's 0xE9 bootloader-enter trigger
+	 * forces a full USB re-enumeration which invalidates our hidraw
+	 * fd, so we can't keep doing IO after firing 0xE9 in the same
+	 * write_firmware call. fwupd's standard pattern (cros-ec et al.)
+	 * is to use FWUPD_DEVICE_FLAG_ANOTHER_WRITE_REQUIRED + a private
+	 * stage-tracking flag transferred via device_class->replace:
+	 *
+	 *   Iteration 1 (PRE_BL_DONE flag NOT set):
+	 *     - pre-bootloader work (passes 0..2): HUB1/HUB2 i2c-tunnel,
+	 *       HUB c8 stage on primary, HUB4 c8 stage on secondary
+	 *     - bootloader-enter 0xE9 on each direct-stage target
+	 *     - set PRE_BL_DONE + ANOTHER_WRITE_REQUIRED, return success
+	 *     - engine waits for replug (WAIT_FOR_REPLUG already set)
+	 *     - engine replaces FuDevice with the re-enumerated one;
+	 *       device_class->replace copies PRE_BL_DONE across
+	 *
+	 *   Iteration 2 (PRE_BL_DONE flag IS set):
+	 *     - post-bootloader work (passes 3..4): PDC + DISPLAY
+	 *     - no flag set, no ANOTHER_WRITE_REQUIRED, install done
+	 *
+	 * On real hardware this gives PDC programming a fresh hidraw fd
+	 * onto the post-bootloader device. On emulation the engine
+	 * doesn't actually replug — the fixture's event cursor walks
+	 * through one continuous stream — but the flag-flip + ANOTHER_
+	 * WRITE_REQUIRED dance still works because both iterations run
+	 * on the same synthetic FuDevice. See AUDIT.md / pcap analysis
+	 * in captures/u4025qw-failrun-20260513-145646.pcapng for the
+	 * real-HW EPROTO that motivated this split. */
+	{
+		gboolean pre_bl_done =
+		    fu_device_has_private_flag(device,
+					       FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE);
+		g_info("dell-monitor-rt: write_firmware phase = %s",
+		       pre_bl_done ? "post-bootloader" : "pre-bootloader");
+	}
+
 	/* Open every paired child device for the duration of write_firmware.
 	 * fwupd's engine only opens the device it's actively flashing (the
 	 * primary parent here); when our route walker dispatches a stage to
@@ -4802,7 +4884,23 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 #define DELL_MONITOR_RT_POST_BOOTLOADER_PHASES 2
 #define DELL_MONITOR_RT_NUM_PASSES                                                                 \
 	(DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES + DELL_MONITOR_RT_POST_BOOTLOADER_PHASES)
-		for (guint pass = 0; pass < DELL_MONITOR_RT_NUM_PASSES; pass++) {
+		/* Iteration 1 runs passes 0..PRE_BL_PASSES-1 (pre-bootloader);
+		 * iteration 2 (PRE_BL_DONE flag set) runs passes PRE_BL_PASSES..
+		 * NUM_PASSES-1 (post-bootloader). The route walker's filter
+		 * logic already discriminates by `route.kind` and `phase_order`
+		 * — limiting the loop range here just skips the irrelevant
+		 * passes early. */
+		guint pass_lo, pass_hi;
+		if (fu_device_has_private_flag(
+			device,
+			FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE)) {
+			pass_lo = DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES;
+			pass_hi = DELL_MONITOR_RT_NUM_PASSES;
+		} else {
+			pass_lo = 0;
+			pass_hi = DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES;
+		}
+		for (guint pass = pass_lo; pass < pass_hi; pass++) {
 			components = fu_firmware_get_images(firmware);
 			for (guint i = 0; i < components->len; i++) {
 				FuDellMonitorRtFirmwareComponent *component =
@@ -4960,6 +5058,23 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 				}
 			}
 		}
+
+		/* If we just finished the pre-bootloader passes, mark
+		 * the stage as done and ask the engine to come back for
+		 * another write_firmware iteration after the device
+		 * re-enumerates (forced by the 0xE9 we just fired). The
+		 * second iteration will run the post-bootloader passes
+		 * with a fresh hidraw fd. */
+		if (pass_hi == DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES) {
+			fu_device_add_private_flag(
+			    device,
+			    FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE);
+			fu_device_add_flag(device,
+					   FWUPD_DEVICE_FLAG_ANOTHER_WRITE_REQUIRED);
+			g_info("dell-monitor-rt: pre-bootloader complete; "
+			       "yielding for replug + post-bootloader "
+			       "iteration");
+		}
 	}
 
 	/* Diagnostic walk — list every component and its computed route
@@ -5022,4 +5137,6 @@ fu_dell_monitor_rt_device_class_init(FuDellMonitorRtDeviceClass *klass)
 	device_class->probe = fu_dell_monitor_rt_device_probe;
 	device_class->setup = fu_dell_monitor_rt_device_setup;
 	device_class->write_firmware = fu_dell_monitor_rt_device_write_firmware;
+	device_class->replace = fu_dell_monitor_rt_device_replace;
+	device_class->cleanup = fu_dell_monitor_rt_device_cleanup;
 }
