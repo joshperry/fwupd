@@ -196,6 +196,60 @@ fu_dell_monitor_rt_device_vcmd(FuDellMonitorRtDevice *self,
 }
 
 /*
+ * Retry wrapper around `vcmd`. Mirrors `RTS5409S_HID::enable_vdcmd`
+ * at libdevices.c:68895, which wraps its single `send_vendor_cmd`
+ * call in a `do…while ((last_error != 0) && (iVar3-- != 0))` with
+ * `iVar3 = 10` — up to 10 retries on transport error. The retries
+ * mask transient HID write failures that show up right after USB
+ * enumeration on this chip family. Used for the setup-phase vendor
+ * commands (`enable_vdcmd`, `enable_high_clock_mode`).
+ */
+static gboolean
+fu_dell_monitor_rt_device_vcmd_retry(FuDellMonitorRtDevice *self,
+				     guint8 dir,
+				     guint8 opcode,
+				     guint8 subcmd,
+				     guint8 arg,
+				     const guint8 *payload,
+				     gsize payload_len,
+				     guint attempts,
+				     GError **error)
+{
+	g_autoptr(GError) last_error = NULL;
+
+	for (guint i = 0; i < attempts; i++) {
+		g_autoptr(GError) attempt_error = NULL;
+		if (fu_dell_monitor_rt_device_vcmd(self,
+						   dir,
+						   opcode,
+						   subcmd,
+						   arg,
+						   payload,
+						   payload_len,
+						   &attempt_error)) {
+			if (i > 0) {
+				g_debug("dell-monitor-rt: vcmd opcode=0x%02x "
+					"succeeded on attempt %u/%u",
+					opcode,
+					i + 1,
+					attempts);
+			}
+			return TRUE;
+		}
+		g_debug("dell-monitor-rt: vcmd opcode=0x%02x attempt %u/%u "
+			"failed: %s",
+			opcode,
+			i + 1,
+			attempts,
+			attempt_error->message);
+		g_clear_error(&last_error);
+		last_error = g_steal_pointer(&attempt_error);
+	}
+	g_propagate_error(error, g_steal_pointer(&last_error));
+	return FALSE;
+}
+
+/*
  * Send a vcmd and pull a response via HIDIOCGINPUT.
  *
  * The wire-byte-0 direction selector (DIR_WRITE 0x40 / DIR_READ 0xC0)
@@ -218,6 +272,7 @@ fu_dell_monitor_rt_device_vcmd_read(FuDellMonitorRtDevice *self,
 				    gsize payload_len,
 				    guint8 *response,
 				    gsize response_len,
+				    gsize *bytes_out,
 				    GError **error)
 {
 	if (!fu_dell_monitor_rt_device_vcmd(self,
@@ -241,15 +296,18 @@ fu_dell_monitor_rt_device_vcmd_read(FuDellMonitorRtDevice *self,
 	{
 		g_autoptr(FuIoctl) ioctl =
 		    fu_udev_device_ioctl_new(FU_UDEV_DEVICE(self));
+		gint rc = 0;
 		if (!fu_ioctl_execute(ioctl,
 				      HIDIOCGINPUT(response_len), /* nocheck:blocked */
 				      response,
 				      response_len,
-				      NULL,
+				      &rc,
 				      DELL_MONITOR_RT_TIMEOUT_MS,
 				      FU_IOCTL_FLAG_NONE,
 				      error))
 			return FALSE;
+		if (bytes_out != NULL)
+			*bytes_out = (rc > 0) ? (gsize)rc : 0;
 	}
 
 	fu_dump_raw(G_LOG_DOMAIN, "vcmd read response", response, response_len);
@@ -291,6 +349,7 @@ fu_dell_monitor_rt_device_read_version(FuDellMonitorRtDevice *self,
 						 sizeof(payload),
 						 response,
 						 sizeof(response),
+						 NULL, /* bytes_out — unused */
 						 error))
 		return FALSE;
 
@@ -425,18 +484,41 @@ fu_dell_monitor_rt_device_handshake(FuDellMonitorRtDevice *self,
 	 * even though it expects a response back via HIDIOCGINPUT. The
 	 * chip would also accept 0xC0 here, but the captured fixture only
 	 * has the 0x40 variant so emulation needs us to match. */
-	if (!fu_dell_monitor_rt_device_vcmd_read(self,
-						 DELL_MONITOR_RT_DIR_WRITE,
-						 DELL_MONITOR_RT_OPCODE_AUTH,
-						 DELL_MONITOR_RT_AUTH_SUB_REQUEST,
-						 0x01, /* arg byte mirrors subcmd in pcap */
-						 NULL,
-						 0,
-						 challenge_resp,
-						 sizeof(challenge_resp),
-						 error)) {
-		g_prefix_error(error, "auth challenge request failed: ");
-		return FALSE;
+	{
+		gsize bytes_in = 0;
+		if (!fu_dell_monitor_rt_device_vcmd_read(self,
+							 DELL_MONITOR_RT_DIR_WRITE,
+							 DELL_MONITOR_RT_OPCODE_AUTH,
+							 DELL_MONITOR_RT_AUTH_SUB_REQUEST,
+							 0x01, /* arg byte mirrors subcmd in pcap */
+							 NULL,
+							 0,
+							 challenge_resp,
+							 sizeof(challenge_resp),
+							 &bytes_in,
+							 error)) {
+			g_prefix_error(error, "auth challenge request failed: ");
+			return FALSE;
+		}
+		/* Wistron's hub_force_handshake (libdevices.c:70912) treats
+		 * `hid_get_input_report` returning fewer than 16 bytes as
+		 * `last_error = 0xf1` ("chip rejected, short response"). We
+		 * mirror that — the cal_auth challenge is exactly 16 bytes,
+		 * so anything shorter means the chip didn't deliver the
+		 * challenge and `cal_auth` would compute a garbage response.
+		 * See AUDIT.md F1.4. The leading byte at challenge_resp[0]
+		 * is the kernel-supplied report-ID prefix; we need 16 bytes
+		 * of actual response data on top of it. */
+		if (bytes_in < 1 + 16) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_READ,
+				    "auth challenge response too short: "
+				    "got %" G_GSIZE_FORMAT " bytes, need ≥ %u",
+				    bytes_in,
+				    (guint)(1 + 16));
+			return FALSE;
+		}
 	}
 
 	/* The 16-byte challenge starts at wire offset 0 of the response,
@@ -1052,15 +1134,21 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 	}
 
 	/* Step 1: enable vendor-command mode (the auth bytes are the
-	 * RealTek vendor ID 0x0BDA placed at wire bytes 4-5). */
-	if (!fu_dell_monitor_rt_device_vcmd(self,
-					    DELL_MONITOR_RT_DIR_WRITE,
-					    DELL_MONITOR_RT_OPCODE_ENABLE_VDCMD,
-					    0x01, /* "enable" */
-					    0x00,
-					    vendor_sig,
-					    sizeof(vendor_sig),
-					    &error_local)) {
+	 * RealTek vendor ID 0x0BDA placed at wire bytes 4-5).
+	 *
+	 * Wistron retries this up to 10× on `last_error != 0`
+	 * (libdevices.c:68895) — see AUDIT.md F1.1. The retries mask
+	 * transient HID write failures right after USB enumeration. */
+	if (!fu_dell_monitor_rt_device_vcmd_retry(
+		self,
+		DELL_MONITOR_RT_DIR_WRITE,
+		DELL_MONITOR_RT_OPCODE_ENABLE_VDCMD,
+		0x01, /* "enable" */
+		0x00,
+		vendor_sig,
+		sizeof(vendor_sig),
+		10, /* Wistron's retry budget */
+		&error_local)) {
 		g_warning("dell-monitor-rt: enable_vdcmd failed: %s",
 			  error_local->message);
 		fu_device_set_version(device, "0.0.0-no-vdcmd");
@@ -1069,16 +1157,21 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 
 	/* Step 2: enable high-clock mode (Dell's binary's frame 7702 — the
 	 * second thing it sends after enable_vdcmd). May not be strictly
-	 * required for version-read but matches the captured init order. */
+	 * required for version-read but matches the captured init order.
+	 * Wistron's enable_high_clock_mode (libdevices.c:68992) is
+	 * single-shot in the decomp — no retry loop — but we apply the
+	 * same retry budget for consistency. */
 	g_clear_error(&error_local);
-	if (!fu_dell_monitor_rt_device_vcmd(self,
-					    DELL_MONITOR_RT_DIR_WRITE,
-					    DELL_MONITOR_RT_OPCODE_ENABLE_HIGH_CLOCK,
-					    0x01, /* "enable" */
-					    0x00,
-					    NULL,
-					    0,
-					    &error_local)) {
+	if (!fu_dell_monitor_rt_device_vcmd_retry(
+		self,
+		DELL_MONITOR_RT_DIR_WRITE,
+		DELL_MONITOR_RT_OPCODE_ENABLE_HIGH_CLOCK,
+		0x01, /* "enable" */
+		0x00,
+		NULL,
+		0,
+		10,
+		&error_local)) {
 		g_warning("dell-monitor-rt: enable_high_clock failed: %s",
 			  error_local->message);
 		fu_device_set_version(device, "0.0.0-no-hiclk");
