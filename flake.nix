@@ -149,6 +149,19 @@
 
           mkdir -p "$stage"
 
+          # Stage the built quirk file into the dev-mode --localstatedir
+          # so fwupdtool can find it at runtime. Without this, fwupd
+          # doesn't know about our plugin's HIDRAW VID/DEV matching and
+          # the device never gets associated with the plugin — emulation
+          # fails silently with "No detected devices". fwupd-configure's
+          # `rm -rf build` wipes the previously-staged file, so we have
+          # to re-stage every time the build dir is fresh.
+          quirk_src="$plugin_dir/dell-monitor-rt.quirk"
+          quirk_staged="$MESON_BUILD_DIR/_local/lib/fwupd/quirks.d/builtin.quirk.gz"
+          if [[ ! -f "$quirk_staged" || "$quirk_src" -nt "$quirk_staged" ]]; then
+            fwupd-stage-quirks
+          fi
+
           # Regenerate the fixture if missing or stale relative to the
           # specializer or pcap. The specializer owns the wire format
           # (Report-ID prefix, phase split at 0xE9, structural-event
