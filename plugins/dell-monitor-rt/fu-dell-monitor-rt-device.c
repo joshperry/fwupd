@@ -135,6 +135,13 @@ static const guint8 DELL_MONITOR_RT_U4025QW_SYNKEY_SEED[18] = {
 
 struct _FuDellMonitorRtDevice {
 	FuHidrawDevice parent_instance;
+	/* Panel-id read during setup() and reused by verify_baseline. Wistron's
+	 * tool reads VCP 0xEE exactly once, during the info-display phase
+	 * before the install button is clicked, then caches the value for the
+	 * panel-binding check at install time. We mirror that lifecycle so our
+	 * wire trace converges on the captured pcap (read-once during setup,
+	 * no install-time re-emit). NULL until setup() populates it. */
+	gchar *cached_panel_id;
 };
 
 G_DEFINE_TYPE(FuDellMonitorRtDevice, fu_dell_monitor_rt_device, FU_TYPE_HIDRAW_DEVICE)
@@ -908,21 +915,29 @@ fu_dell_monitor_rt_device_read_panel_id(FuDellMonitorRtDevice *self,
 }
 
 /*
- * verify_baseline — pre-flash sanity pass that runs before any device IO
- * that mutates state.
+ * verify_baseline — pre-flash panel-binding check that runs before any
+ * device IO that mutates state.
  *
- * Two checks:
+ * Walks the .upg components: any with `panel_bound: TRUE` MUST have
+ * `panel_id` matching the chip's reported value. A mismatch means this
+ * .upg is for a different panel SKU; flashing it would brick the monitor.
+ * Fail hard.
  *
- *   1. Read IspTag for diagnostics. Log the prefix (`ISP#` or `CHK#`)
- *      and the chip's currently-installed package version. We do NOT
- *      gate on the prefix — Dell's binary doesn't either (decomp walk
- *      in PLUGIN_NOTES "Does Dell branch on the prefix?"). Both states
- *      flash successfully in our captured fixture.
+ * The chip-side panel-id was read once during device_setup() (VCP 0xEE
+ * to slave 0x6E, FL5500 scaler) and stashed in self->cached_panel_id —
+ * see fu_dell_monitor_rt_device_setup. Wistron's tool follows the same
+ * pattern: VCP 0xEE fires three times during the info-display phase
+ * (pcap positions 8/68/140 in the captured trace), then never again for
+ * the rest of the update. Reading panel-id at install time would diverge
+ * from that pattern — the matcher would leapfrog forward past the
+ * captured staging events looking for a VCP 0xEE write that doesn't
+ * exist in the install.json portion of the fixture, and on real hardware
+ * we'd be issuing a redundant DDC/CI probe that Wistron deliberately
+ * doesn't.
  *
- *   2. Read panel id (VCP 0xEE). Walk the .upg components: any with
- *      `panel_bound: TRUE` MUST have `panel_id` matching the chip's
- *      reported value. A mismatch means this .upg is for a different
- *      panel SKU; flashing it would brick the monitor. Fail hard.
+ * The IspTag is also read in setup() and surfaced via fu_device_set_
+ * version, so engine-level "is this a re-install?" filtering already
+ * has it. We don't repeat that read here.
  *
  * We deliberately do NOT short-circuit on "version already matches" —
  * fwupd's engine already filters that case at a higher level (via the
@@ -931,34 +946,15 @@ fu_dell_monitor_rt_device_read_panel_id(FuDellMonitorRtDevice *self,
  * just complicate emulation testing without adding safety.
  *
  * Returns TRUE on success (proceed with install). Returns FALSE on
- * panel mismatch, missing metadata, or read failure.
+ * panel mismatch, missing metadata, or missing cache (setup() failed
+ * to read panel-id).
  */
 static gboolean
 fu_dell_monitor_rt_device_verify_baseline(FuDellMonitorRtDevice *self,
 					  FuDellMonitorRtFirmware *fw_container,
 					  GError **error)
 {
-	FuDellMonitorRtIspTag tag = {0};
-	g_autofree gchar *panel_id = NULL;
 	GPtrArray *components;
-
-	/* 1. IspTag read — diagnostic only. */
-	if (!fu_dell_monitor_rt_device_read_isptag(self, &tag, error)) {
-		g_prefix_error(error, "verify_baseline: IspTag read failed: ");
-		return FALSE;
-	}
-	g_info("dell-monitor-rt: verify_baseline — chip IspTag prefix=%s "
-	       "version=%s",
-	       fu_dell_monitor_rt_isptag_state_str(tag.state),
-	       tag.version);
-	g_free(tag.version);
-
-	/* 2. Panel binding check. */
-	if (!fu_dell_monitor_rt_device_read_panel_id(self, &panel_id, error)) {
-		g_prefix_error(error, "verify_baseline: panel-id read failed: ");
-		return FALSE;
-	}
-	g_info("dell-monitor-rt: verify_baseline — chip panel id=%s", panel_id);
 
 	components = fu_firmware_get_images(FU_FIRMWARE(fw_container));
 	for (guint i = 0; i < components->len; i++) {
@@ -980,7 +976,18 @@ fu_dell_monitor_rt_device_verify_baseline(FuDellMonitorRtDevice *self,
 				    fu_firmware_get_id(FU_FIRMWARE(component)));
 			return FALSE;
 		}
-		if (g_strcmp0(panel_id, component_panel_id) != 0) {
+		if (self->cached_panel_id == NULL) {
+			g_set_error(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_SUPPORTED,
+				    "verify_baseline: component '%s' is "
+				    "panel-bound but the chip's panel-id was "
+				    "not read during setup; refusing to flash "
+				    "without confirming panel match",
+				    fu_firmware_get_id(FU_FIRMWARE(component)));
+			return FALSE;
+		}
+		if (g_strcmp0(self->cached_panel_id, component_panel_id) != 0) {
 			g_set_error(error,
 				    FWUPD_ERROR,
 				    FWUPD_ERROR_NOT_SUPPORTED,
@@ -989,7 +996,7 @@ fu_dell_monitor_rt_device_verify_baseline(FuDellMonitorRtDevice *self,
 				    "Refusing to flash panel-bound firmware to a "
 				    "different panel — that would brick it.",
 				    component_panel_id,
-				    panel_id);
+				    self->cached_panel_id);
 			return FALSE;
 		}
 	}
@@ -1119,13 +1126,23 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 		return TRUE;
 	}
 
-	/* Step 3: read the user-facing package version (e.g. "M3T105") via
-	 * a DDC/CI request to the FL5500 scaler. Dell's binary issues VCP
-	 * selector 0xAD (51 84 c0 99 ad 18 57 to target 0x6E) which returns
-	 * "ISP#M3T105#" — the same string Dell's UI shows. We previously
-	 * read selector 0xCC which returns "753.0AK01.0007" (the scaler
-	 * component's firmware ID, NOT the user-facing version), so the
-	 * surfaced device version was misleading.
+	/* Step 3: read panel id (VCP 0xEE) and cache on the device. Order
+	 * matters: Wistron's tool reads VCP 0xEE during the info-display phase
+	 * BEFORE the IspTag read (pcap positions 8/68/140 vs. 206/218). The
+	 * matcher walks the event stream forward, so reading IspTag first
+	 * would advance the cursor past the VCP 0xEE events and the panel-id
+	 * read would leapfrog forward looking for an event that no longer
+	 * exists in the remaining setup.json window. We mirror Wistron's
+	 * order — panel-id, then IspTag — so each read finds its matching
+	 * event in place. The cached value is reused by verify_baseline so
+	 * VCP 0xEE never re-fires during the install phase.
+	 *
+	 * Step 4 below reads VCP 0xAD (IspTag) to get the user-facing package
+	 * version (e.g. "M3T105"). The wire request is 51 84 c0 99 ad 18 57 to
+	 * slave 0x6E, returning "ISP#M3T105#" — the same string Dell's UI
+	 * shows. We previously read selector 0xCC which returns
+	 * "753.0AK01.0007" (the scaler component's firmware ID, not the
+	 * user-facing version), so the surfaced device version was misleading.
 	 *
 	 * We deliberately don't call read_version (the hub MCU's internal
 	 * 0x09 opcode probe) here: Dell's binary doesn't issue 0xC0 0x09
@@ -1136,6 +1153,24 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 	 * scaler probe needs next. Following Dell's sequence
 	 * (enable_vdcmd → enable_high_clock → cal_auth → i2c_write →
 	 * i2c_read) keeps the event cursor in step with the fixture. */
+	g_clear_error(&error_local);
+	{
+		g_autofree gchar *panel_id = NULL;
+		if (!fu_dell_monitor_rt_device_read_panel_id(self,
+							     &panel_id,
+							     &error_local)) {
+			g_warning("dell-monitor-rt: panel-id read failed: %s",
+				  error_local->message);
+			fu_device_set_version(device, "0.0.0-no-panel-id");
+			return TRUE;
+		}
+		g_debug("dell-monitor-rt: panel id=%s", panel_id);
+		g_free(self->cached_panel_id);
+		self->cached_panel_id = g_steal_pointer(&panel_id);
+	}
+
+	/* Step 4: read the user-facing IspTag (VCP 0xAD) for fwupd's device
+	 * version field. */
 	g_clear_error(&error_local);
 	{
 		FuDellMonitorRtIspTag tag = {0};
@@ -4329,9 +4364,19 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 }
 
 static void
+fu_dell_monitor_rt_device_finalize(GObject *object)
+{
+	FuDellMonitorRtDevice *self = FU_DELL_MONITOR_RT_DEVICE(object);
+	g_free(self->cached_panel_id);
+	G_OBJECT_CLASS(fu_dell_monitor_rt_device_parent_class)->finalize(object);
+}
+
+static void
 fu_dell_monitor_rt_device_class_init(FuDellMonitorRtDeviceClass *klass)
 {
+	GObjectClass *object_class = G_OBJECT_CLASS(klass);
 	FuDeviceClass *device_class = FU_DEVICE_CLASS(klass);
+	object_class->finalize = fu_dell_monitor_rt_device_finalize;
 	device_class->probe = fu_dell_monitor_rt_device_probe;
 	device_class->setup = fu_dell_monitor_rt_device_setup;
 	device_class->write_firmware = fu_dell_monitor_rt_device_write_firmware;
