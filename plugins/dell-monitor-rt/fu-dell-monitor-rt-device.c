@@ -3711,14 +3711,208 @@ fu_dell_monitor_rt_proto_rts540x_arm(FuDellMonitorRtDevice *target, GError **err
 	return TRUE;
 }
 
+/*
+ * Send the verify_update_fw probe (opcode 0xD9 sub=1) and poll the
+ * input report up to 3 times for a result byte == 0x01.
+ *
+ * Mirrors RTS5409S_HID::verify_update_fw at libdevices.c:69247:
+ *   - send 40 D9 01 00 ...
+ *   - nanosleep(_DAT_002d2110, 0)        (~100 ms initial settle)
+ *   - loop 3×:
+ *       hid_get_input_report → rc
+ *         rc > 0 : success, *result = in_payload (response[1])
+ *         rc == 0: last_error = 0xf1, exit
+ *         rc < 0 : sleep _DAT_002d1160 (~5 ms), retry
+ *
+ * The two timing constants live in libdevices.so .data and we don't
+ * have their exact values; 100 ms / 5 ms are conservative defaults
+ * that match the visible cadence in the captured pcap (verify_update_fw
+ * input-report polls land roughly that far apart).
+ *
+ * Caller is expected to treat *result != 0x01 as a chip-side reject
+ * (matching the "status check fail" branch in update_self at
+ * libdevices.c:70066).
+ */
+static gboolean
+fu_dell_monitor_rt_device_verify_update_fw(FuDellMonitorRtDevice *self,
+					   guint8 *result,
+					   GError **error)
+{
+	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	gsize bytes_in = 0;
+
+	g_return_val_if_fail(result != NULL, FALSE);
+
+	if (!fu_dell_monitor_rt_device_vcmd(self,
+					    DELL_MONITOR_RT_DIR_WRITE,
+					    0xD9,
+					    0x01, /* sub0 = 1 */
+					    0x00,
+					    NULL,
+					    0,
+					    error)) {
+		g_prefix_error(error, "verify_update_fw probe: ");
+		return FALSE;
+	}
+
+	g_usleep(100 * 1000); /* initial settle, ~_DAT_002d2110 */
+
+	for (guint attempt = 0; attempt < 3; attempt++) {
+		g_autoptr(FuIoctl) ioctl =
+		    fu_udev_device_ioctl_new(FU_UDEV_DEVICE(self));
+		gint rc = 0;
+		g_autoptr(GError) err_local = NULL;
+
+		memset(response, 0, sizeof(response));
+		if (!fu_ioctl_execute(ioctl,
+				      HIDIOCGINPUT(sizeof(response)), /* nocheck:blocked */
+				      response,
+				      sizeof(response),
+				      &rc,
+				      DELL_MONITOR_RT_TIMEOUT_MS,
+				      FU_IOCTL_FLAG_NONE,
+				      &err_local)) {
+			/* transport error → retry up to 3× per Wistron */
+			g_debug("verify_update_fw poll %u: %s",
+				attempt,
+				err_local->message);
+			g_usleep(5 * 1000); /* ~_DAT_002d1160 retry sleep */
+			continue;
+		}
+
+		/* ioctl succeeded → response buffer is populated.
+		 *
+		 * Under emulation, fu_ioctl_execute returns success with
+		 * rc unpopulated (rc stays 0) because it replays event
+		 * DataOut into the buffer without setting rc through
+		 * fu_device_event_copy_data. Under real hardware rc is
+		 * the byte count from HIDIOCGINPUT.
+		 *
+		 * Wistron's loop treats rc == 0 as "chip not ready,
+		 * retry" (last_error = 0xf1). We can't reproduce that
+		 * gating under emulation, so we only enforce the
+		 * rc == 0 retry path when rc actually got a value. The
+		 * caller checks result_byte == 0x01; if the chip really
+		 * wasn't ready, response[1] stays 0 and the caller's
+		 * status-check fails, which is the right outcome. */
+		bytes_in = (rc > 0) ? (gsize)rc : 0;
+		if (rc > 0 && bytes_in == 0) {
+			/* real HW saying "not ready yet" — retry */
+			g_usleep(5 * 1000);
+			continue;
+		}
+		*result = response[1];
+		fu_dump_raw(G_LOG_DOMAIN,
+			    "verify_update_fw response",
+			    response,
+			    sizeof(response));
+		return TRUE;
+	}
+
+	g_set_error_literal(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_READ,
+			    "verify_update_fw: 3 input-report polls failed");
+	return FALSE;
+}
+
+/*
+ * Issue enable_vdcmd(true, false) — the cleanup half of
+ * RTS5409S_HID::update_self's envelope at libdevices.c:70094. Disables
+ * high_clock mode and leaves vdcmd enabled. Wire bytes:
+ *   40 02 01 00 DA 0B 00 …
+ *
+ * Always called after the chunk loop completes (success or failure),
+ * matching update_self's two enable_vdcmd cleanup callsites at
+ * LAB_001b77e2 and the in-line one at libdevices.c:70073.
+ */
+static gboolean
+fu_dell_monitor_rt_device_disarm_vdcmd(FuDellMonitorRtDevice *self,
+				       GError **error)
+{
+	const guint8 vendor_sig[2] = {DELL_MONITOR_RT_VENDOR_SIG_LO,
+				      DELL_MONITOR_RT_VENDOR_SIG_HI};
+	if (!fu_dell_monitor_rt_device_vcmd(self,
+					    DELL_MONITOR_RT_DIR_WRITE,
+					    DELL_MONITOR_RT_OPCODE_ENABLE_VDCMD,
+					    0x01, /* sub0 = 1 → high_clock=false */
+					    0x00,
+					    vendor_sig,
+					    sizeof(vendor_sig),
+					    error)) {
+		g_prefix_error(error, "rts540x cleanup enable_vdcmd sub=1: ");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
+ * Wrap stage_isp_firmware in the verify+cleanup tail of Wistron's
+ * `RTS5409S_HID::update_self` envelope (AUDIT.md F3.2):
+ *
+ *   1. enable_vdcmd(true, true)        ← arm_target (proto_rts540x_arm)
+ *   2. erase_spare_bank                 ← arm_target
+ *   3. write_hub_flash chunk loop       ← stage_isp_firmware (here)
+ *   4. verify_update_fw + result check  ← here
+ *   5. enable_vdcmd(true, false)        ← here (always, even on error)
+ *
+ * Steps 1+2 are emitted by the proto's arm_target callback (the route
+ * walker calls it once per (target, proto) pair before the first
+ * stage). RTS540x has exactly one stage per (target, proto), so 3+4+5
+ * naturally fit here.
+ *
+ * Step 4 ("trailing partial chunk write" in update_self) is omitted
+ * deliberately — F2.5 in AUDIT.md, Tier 2: U4025QW HUB blobs are 64-KB
+ * aligned so the partial branch never fires, but the code is missing
+ * if a future Dell payload is non-aligned.
+ */
 static gboolean
 fu_dell_monitor_rt_proto_rts540x_stage(FuDellMonitorRtDevice *target,
 				       const FuDellMonitorRtRoute *route,
 				       GBytes *blob,
 				       GError **error)
 {
+	g_autoptr(GError) stage_error = NULL;
+	guint8 verify_result = 0xFF;
+
 	(void)route; /* DIRECT_STAGE — the route's i2c_target is unused */
-	return fu_dell_monitor_rt_device_stage_isp_firmware(target, blob, NULL, error);
+
+	if (!fu_dell_monitor_rt_device_stage_isp_firmware(target,
+							  blob,
+							  NULL,
+							  &stage_error)) {
+		/* Failure path: still try to disarm so the chip isn't
+		 * left in high_clock+vdcmd mode. Ignore disarm errors
+		 * since the original failure is the user-visible one. */
+		g_autoptr(GError) ignored = NULL;
+		fu_dell_monitor_rt_device_disarm_vdcmd(target, &ignored);
+		g_propagate_error(error, g_steal_pointer(&stage_error));
+		return FALSE;
+	}
+
+	if (!fu_dell_monitor_rt_device_verify_update_fw(target,
+							&verify_result,
+							error)) {
+		g_autoptr(GError) ignored = NULL;
+		fu_dell_monitor_rt_device_disarm_vdcmd(target, &ignored);
+		g_prefix_error(error, "rts540x verify_update_fw: ");
+		return FALSE;
+	}
+	if (verify_result != 0x01) {
+		g_autoptr(GError) ignored = NULL;
+		fu_dell_monitor_rt_device_disarm_vdcmd(target, &ignored);
+		g_set_error(error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_WRITE,
+			    "rts540x verify_update_fw: chip rejected staged "
+			    "firmware (result byte 0x%02x, want 0x01)",
+			    verify_result);
+		return FALSE;
+	}
+
+	if (!fu_dell_monitor_rt_device_disarm_vdcmd(target, error))
+		return FALSE;
+	return TRUE;
 }
 
 /*
