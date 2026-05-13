@@ -4736,6 +4736,33 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 	 * phase machinery we need to invoke. */
 	fu_device_add_flag(device, FWUPD_DEVICE_FLAG_WAIT_FOR_REPLUG);
 
+	/* Open every paired child device for the duration of write_firmware.
+	 * fwupd's engine only opens the device it's actively flashing (the
+	 * primary parent here); when our route walker dispatches a stage to
+	 * a child target (e.g. HUB4 c8 staging on the secondary 0BDA:1101),
+	 * the child's hidraw fd has never been opened and writes return
+	 * EBADF. The locker array RAII-closes each child when write_firmware
+	 * returns, restoring the pre-install fd state. */
+	g_autoptr(GPtrArray) child_lockers =
+	    g_ptr_array_new_with_free_func(g_object_unref);
+	{
+		GPtrArray *children = fu_device_get_children(device);
+		for (guint i = 0; children != NULL && i < children->len; i++) {
+			FuDevice *child = g_ptr_array_index(children, i);
+			FuDeviceLocker *locker = NULL;
+			if (fu_device_has_flag(child, FWUPD_DEVICE_FLAG_EMULATED))
+				continue; /* synthetic devices have no real fd */
+			locker = fu_device_locker_new(child, error);
+			if (locker == NULL) {
+				g_prefix_error(error,
+					       "opening child %s for install: ",
+					       fu_device_get_id(child));
+				return FALSE;
+			}
+			g_ptr_array_add(child_lockers, locker);
+		}
+	}
+
 	/* Track which (target, proto) pairs have been armed. Keys are
 	 * "<device-id>|<proto-name>" strings. Hash table owns the keys. */
 	{
