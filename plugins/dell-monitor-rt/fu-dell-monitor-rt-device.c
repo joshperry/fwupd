@@ -105,9 +105,11 @@ static const guint8 DELL_MONITOR_RT_U4025QW_SYNKEY_SEED[18] = {
 
 /* Per-chunk polling parameters for the i2c-tunnel ISP loader.
  * RTS5409s_IIC_API::polling_status() in libhub.so issues up to 20 d6
- * reads with ~2ms sleeps between, expecting wire-byte 0 == 0x01. */
+ * reads with 3 ms sleeps between (`nanosleep(0, 3000000ns)` at
+ * libhub.so:0x19b4a0), expecting wire-byte 0 == 0x01. Total budget
+ * 60 ms (AUDIT.md F2.6). */
 #define DELL_MONITOR_RT_I2C_POLL_RETRIES   20
-#define DELL_MONITOR_RT_I2C_POLL_SLEEP_US  2000
+#define DELL_MONITOR_RT_I2C_POLL_SLEEP_US  3000
 #define DELL_MONITOR_RT_I2C_POLL_READY     0x01
 
 /* I²C bus speed config — written into wire byte 10 of the i2c-tunnel
@@ -1489,21 +1491,21 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 	const guint8 begin[] = DELL_MONITOR_RT_I2C_LOADER_BEGIN;
 	const guint8 *blob_data;
 	gsize blob_size;
-	guint nchunks;
+	guint nchunks_full;
+	guint partial;
+	guint nsteps;
 
 	blob_data = g_bytes_get_data(blob, &blob_size);
-	if (blob_size == 0 ||
-	    blob_size % DELL_MONITOR_RT_I2C_LOADER_CHUNK != 0) {
-		g_set_error(error,
-			    FWUPD_ERROR,
-			    FWUPD_ERROR_INVALID_DATA,
-			    "downstream-MCU blob size %" G_GSIZE_FORMAT
-			    " not a multiple of %u",
-			    blob_size,
-			    DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+	if (blob_size == 0) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "downstream-MCU blob is empty");
 		return FALSE;
 	}
-	nchunks = (guint)(blob_size / DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+	nchunks_full = (guint)(blob_size / DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+	partial = (guint)(blob_size % DELL_MONITOR_RT_I2C_LOADER_CHUNK);
+	nsteps = nchunks_full + (partial ? 1 : 0);
 
 	if (!fu_dell_monitor_rt_device_i2c_tunnel_init_step(self,
 							    i2c_target,
@@ -1514,9 +1516,9 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 		return FALSE;
 
 	if (progress != NULL)
-		fu_progress_set_steps(progress, nchunks);
+		fu_progress_set_steps(progress, nsteps);
 
-	for (guint i = 0; i < nchunks; i++) {
+	for (guint i = 0; i < nchunks_full; i++) {
 		guint8 frame[DELL_MONITOR_RT_I2C_LOADER_FRAME];
 
 		frame[0] = DELL_MONITOR_RT_I2C_LOADER_CMD;
@@ -1534,7 +1536,7 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 				       "downstream-MCU stage to 0x%02x failed at chunk %u/%u: ",
 				       i2c_target,
 				       i,
-				       nchunks);
+				       nchunks_full);
 			return FALSE;
 		}
 		if (!fu_dell_monitor_rt_device_i2c_tunnel_poll(self,
@@ -1543,7 +1545,47 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 			g_prefix_error(error,
 				       "downstream-MCU poll after chunk %u/%u to 0x%02x: ",
 				       i,
-				       nchunks,
+				       nchunks_full,
+				       i2c_target);
+			return FALSE;
+		}
+
+		if (progress != NULL)
+			fu_progress_step_done(progress);
+	}
+
+	/* Trailing partial chunk (AUDIT.md F2.5). Wistron's program()
+	 * emits a final write_flash with the residue count when the
+	 * blob isn't a multiple of 0x40 (libhub.c::Rts5409s_IIC_ISP::
+	 * program does `if (uVar7 != (size & 0x40 - 1)) write_flash(...,
+	 * residue)`). The U4025QW HUB blobs are 64-aligned so this
+	 * branch never fires for the current M3T105 firmware, but the
+	 * code is here so future Dell payloads work without surprise. */
+	if (partial > 0) {
+		guint8 frame[DELL_MONITOR_RT_I2C_LOADER_FRAME];
+		memset(frame, 0, sizeof(frame));
+		frame[0] = DELL_MONITOR_RT_I2C_LOADER_CMD;
+		frame[1] = (guint8)partial; /* count, not the full 0x40 */
+		memcpy(&frame[2],
+		       blob_data + (nchunks_full * DELL_MONITOR_RT_I2C_LOADER_CHUNK),
+		       partial);
+
+		if (!fu_dell_monitor_rt_device_i2c_write(self,
+							 i2c_target,
+							 frame,
+							 2 + partial,
+							 error)) {
+			g_prefix_error(error,
+				       "downstream-MCU stage to 0x%02x failed at trailing partial chunk (%u bytes): ",
+				       i2c_target,
+				       partial);
+			return FALSE;
+		}
+		if (!fu_dell_monitor_rt_device_i2c_tunnel_poll(self,
+							       i2c_target,
+							       error)) {
+			g_prefix_error(error,
+				       "downstream-MCU poll after trailing partial chunk to 0x%02x: ",
 				       i2c_target);
 			return FALSE;
 		}
@@ -1637,22 +1679,42 @@ gboolean
 fu_dell_monitor_rt_device_enter_bootloader(FuDellMonitorRtDevice *self,
 					   GError **error)
 {
-	for (guint i = 0; i < 2; i++) {
-		if (!fu_dell_monitor_rt_device_vcmd(self,
-						    DELL_MONITOR_RT_DIR_WRITE,
-						    DELL_MONITOR_RT_OPCODE_BOOTLOADER_ENTER,
-						    0x00,
-						    0x00,
-						    NULL,
-						    0,
-						    error)) {
-			g_prefix_error(error,
-				       "bootloader-enter trigger %u failed: ",
-				       i);
-			return FALSE;
-		}
+	/* Wistron emits 0xE9 twice per phase boundary in the captured
+	 * trace: once via `reset_to_flash` (single-shot) and once via
+	 * `reset_self` (libdevices.c:70110, retry up to 3× until
+	 * send_vendor_cmd returns 0). For our plugin's case the chip
+	 * only needs one successful emit to re-enumerate; we mirror
+	 * `reset_self`'s pattern — a single emit with up to 3 retries
+	 * on transport failure (AUDIT.md F4.1). On the success path
+	 * this matches just the first of the captured pair, leaving
+	 * the second event in the fixture unconsumed by the leapfrog
+	 * matcher (harmless: the split-at-4th-0xE9 reload boundary is
+	 * computed at fixture-build time and isn't affected). */
+	guint attempts = 3;
+	g_autoptr(GError) last_error = NULL;
+	for (guint i = 0; i < attempts; i++) {
+		g_autoptr(GError) attempt_error = NULL;
+		if (fu_dell_monitor_rt_device_vcmd(self,
+						   DELL_MONITOR_RT_DIR_WRITE,
+						   DELL_MONITOR_RT_OPCODE_BOOTLOADER_ENTER,
+						   0x00,
+						   0x00,
+						   NULL,
+						   0,
+						   &attempt_error))
+			return TRUE;
+		g_clear_error(&last_error);
+		last_error = g_steal_pointer(&attempt_error);
+		g_debug("bootloader-enter attempt %u/%u failed: %s",
+			i + 1,
+			attempts,
+			last_error->message);
 	}
-	return TRUE;
+	g_propagate_prefixed_error(error,
+				   g_steal_pointer(&last_error),
+				   "bootloader-enter trigger failed after %u attempts: ",
+				   attempts);
+	return FALSE;
 }
 
 /* ----- TI TPS6598x 4CC command primitives -------------------------
@@ -3739,7 +3801,8 @@ struct _FuDellMonitorRtRoute {
  * in the captured stream — but the wire bytes are missing.
  */
 static gboolean
-fu_dell_monitor_rt_proto_rts540x_arm(FuDellMonitorRtDevice *target, GError **error)
+fu_dell_monitor_rt_proto_rts540x_arm_inner(FuDellMonitorRtDevice *target,
+					   GError **error)
 {
 	const guint8 vendor_sig[2] = {DELL_MONITOR_RT_VENDOR_SIG_LO,
 				      DELL_MONITOR_RT_VENDOR_SIG_HI};
@@ -3772,6 +3835,22 @@ fu_dell_monitor_rt_proto_rts540x_arm(FuDellMonitorRtDevice *target, GError **err
 		g_prefix_error(error, "rts540x arm 0xE8: ");
 		return FALSE;
 	}
+	return TRUE;
+}
+
+/*
+ * Proto's arm_target callback is a no-op for rts540x — the arm step
+ * is part of the per-stage update_self envelope (which the route
+ * walker retries via stage_blob), so doing it here too would emit
+ * the arm bytes twice on the wire. The route walker still calls
+ * arm_target once before the first stage; we let it pass through
+ * without any IO.
+ */
+static gboolean
+fu_dell_monitor_rt_proto_rts540x_arm(FuDellMonitorRtDevice *target, GError **error)
+{
+	(void)target;
+	(void)error;
 	return TRUE;
 }
 
@@ -3930,53 +4009,96 @@ fu_dell_monitor_rt_device_disarm_vdcmd(FuDellMonitorRtDevice *self,
  * aligned so the partial branch never fires, but the code is missing
  * if a future Dell payload is non-aligned.
  */
+/*
+ * One pass of the full RTS5409S_HID::update_self envelope:
+ *   arm (enable_vdcmd sub=3 + erase_spare_bank)
+ *     → chunk loop
+ *     → verify_update_fw + result check
+ *     → disarm (enable_vdcmd sub=1)
+ *
+ * Disarm fires on every exit path so the chip isn't left in
+ * high_clock+vdcmd mode if a step in the middle fails.
+ */
+static gboolean
+fu_dell_monitor_rt_proto_rts540x_envelope_once(FuDellMonitorRtDevice *target,
+					       GBytes *blob,
+					       GError **error)
+{
+	guint8 verify_result = 0xFF;
+	g_autoptr(GError) inner_error = NULL;
+
+	if (!fu_dell_monitor_rt_proto_rts540x_arm_inner(target, &inner_error))
+		goto fail;
+	if (!fu_dell_monitor_rt_device_stage_isp_firmware(target,
+							  blob,
+							  NULL,
+							  &inner_error))
+		goto fail;
+	if (!fu_dell_monitor_rt_device_verify_update_fw(target,
+							&verify_result,
+							&inner_error)) {
+		g_prefix_error(&inner_error, "rts540x verify_update_fw: ");
+		goto fail;
+	}
+	if (verify_result != 0x01) {
+		g_set_error(&inner_error,
+			    FWUPD_ERROR,
+			    FWUPD_ERROR_WRITE,
+			    "rts540x verify_update_fw: chip rejected staged "
+			    "firmware (result byte 0x%02x, want 0x01)",
+			    verify_result);
+		goto fail;
+	}
+	if (!fu_dell_monitor_rt_device_disarm_vdcmd(target, &inner_error))
+		goto fail;
+	return TRUE;
+
+fail:;
+	g_autoptr(GError) ignored = NULL;
+	fu_dell_monitor_rt_device_disarm_vdcmd(target, &ignored);
+	g_propagate_error(error, g_steal_pointer(&inner_error));
+	return FALSE;
+}
+
 static gboolean
 fu_dell_monitor_rt_proto_rts540x_stage(FuDellMonitorRtDevice *target,
 				       const FuDellMonitorRtRoute *route,
 				       GBytes *blob,
 				       GError **error)
 {
-	g_autoptr(GError) stage_error = NULL;
-	guint8 verify_result = 0xFF;
+	/* Outer 5-attempt retry around the full update_self envelope,
+	 * matching Rts5409s_ISP::isp at libhub.c:49226 (asm
+	 * libhub.so:0x99360):
+	 *   uVar15 = 1;
+	 *   do { uVar8 = update_self(...); if (!uVar8) goto SUCCESS;
+	 *        nanosleep(1s); uVar15++; } while (uVar15 != 6);
+	 * Each retry re-arms (enable_vdcmd sub=3 + 0xE8) — same chip-
+	 * mode prep update_self does on every call. AUDIT.md F3.4. */
+	const guint max_attempts = 5;
+	g_autoptr(GError) last_error = NULL;
 
 	(void)route; /* DIRECT_STAGE — the route's i2c_target is unused */
 
-	if (!fu_dell_monitor_rt_device_stage_isp_firmware(target,
-							  blob,
-							  NULL,
-							  &stage_error)) {
-		/* Failure path: still try to disarm so the chip isn't
-		 * left in high_clock+vdcmd mode. Ignore disarm errors
-		 * since the original failure is the user-visible one. */
-		g_autoptr(GError) ignored = NULL;
-		fu_dell_monitor_rt_device_disarm_vdcmd(target, &ignored);
-		g_propagate_error(error, g_steal_pointer(&stage_error));
-		return FALSE;
+	for (guint attempt = 0; attempt < max_attempts; attempt++) {
+		g_autoptr(GError) attempt_error = NULL;
+		if (fu_dell_monitor_rt_proto_rts540x_envelope_once(target,
+								   blob,
+								   &attempt_error))
+			return TRUE;
+		g_clear_error(&last_error);
+		last_error = g_steal_pointer(&attempt_error);
+		g_debug("rts540x update_self attempt %u/%u failed: %s",
+			attempt + 1,
+			max_attempts,
+			last_error->message);
+		if (attempt + 1 < max_attempts)
+			g_usleep(1000 * 1000); /* 1 s between attempts */
 	}
-
-	if (!fu_dell_monitor_rt_device_verify_update_fw(target,
-							&verify_result,
-							error)) {
-		g_autoptr(GError) ignored = NULL;
-		fu_dell_monitor_rt_device_disarm_vdcmd(target, &ignored);
-		g_prefix_error(error, "rts540x verify_update_fw: ");
-		return FALSE;
-	}
-	if (verify_result != 0x01) {
-		g_autoptr(GError) ignored = NULL;
-		fu_dell_monitor_rt_device_disarm_vdcmd(target, &ignored);
-		g_set_error(error,
-			    FWUPD_ERROR,
-			    FWUPD_ERROR_WRITE,
-			    "rts540x verify_update_fw: chip rejected staged "
-			    "firmware (result byte 0x%02x, want 0x01)",
-			    verify_result);
-		return FALSE;
-	}
-
-	if (!fu_dell_monitor_rt_device_disarm_vdcmd(target, error))
-		return FALSE;
-	return TRUE;
+	g_propagate_prefixed_error(error,
+				   g_steal_pointer(&last_error),
+				   "rts540x update_self failed after %u attempts: ",
+				   max_attempts);
+	return FALSE;
 }
 
 /*
