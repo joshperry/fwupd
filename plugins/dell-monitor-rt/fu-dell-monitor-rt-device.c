@@ -1051,47 +1051,6 @@ fu_dell_monitor_rt_device_setup(FuDevice *device, GError **error)
 		return TRUE;
 	}
 
-	/* SAFETY GUARD — see write_firmware for the full rationale. setup()
-	 * issues real writes too (enable_vdcmd, cal_auth response, i2c_write
-	 * for the DDC/CI version probe), so we must refuse the same way if
-	 * fwupd hasn't tagged the device emulated. The IO helpers
-	 * (fu_udev_device_write etc.) only intercept when EMULATED is set —
-	 * absent that flag they fall through to /dev/hidrawN. Skip the
-	 * vendor-command init entirely; report a placeholder version so
-	 * fwupd still has something to display in get-devices output.
-	 *
-	 * Also inhibit the device so install dispatch ignores it. When an
-	 * emulation fixture is loaded, the engine ends up with two matching
-	 * U4025QW entries (the real hidraw and the synthetic emulated one);
-	 * without inhibiting the real one, the engine picks it for install
-	 * by enumeration order, our write_firmware refuses, and the
-	 * emulated entry never gets exercised. The inhibit makes the
-	 * emulated entry the only viable target. */
-	if (!fu_device_has_flag(device, FWUPD_DEVICE_FLAG_EMULATED)) {
-		g_warning("dell-monitor-rt: setup skipped — device is not "
-			  "tagged FWUPD_DEVICE_FLAG_EMULATED, refusing to "
-			  "send vendor commands to real hardware until the "
-			  "protocol is fully validated under emulation");
-		fu_device_set_version(device, "0.0.0-real-hw-locked");
-		/* Use the "hidden" inhibit ID specifically — fu_device_list_
-		 * get_active filters those out (fu-device-list.c:239), so
-		 * the engine's install dispatch never considers this real
-		 * device as a candidate. Without this, the real device and
-		 * the synthetic emulated device both show up in install
-		 * candidates; the engine's composite-update model is
-		 * all-or-nothing, so the real device's safety-guard refusal
-		 * aborts the entire install before write_firmware on the
-		 * synthetic ever runs. With "hidden", only the synthetic
-		 * remains an install candidate when an emulation fixture
-		 * is loaded — which is exactly what we want during
-		 * protocol bring-up. */
-		fu_device_inhibit(device,
-				  "hidden",
-				  "real-hardware install disabled during plugin "
-				  "bring-up; load an emulation fixture to test");
-		return TRUE;
-	}
-
 	/* Step 1: enable vendor-command mode (the auth bytes are the
 	 * RealTek vendor ID 0x0BDA placed at wire bytes 4-5). */
 	if (!fu_dell_monitor_rt_device_vcmd(self,
@@ -4042,33 +4001,6 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 	g_info("dell-monitor-rt: write_firmware — product=%s fw_version=%s",
 	       fu_dell_monitor_rt_firmware_get_product(fw_container),
 	       fu_dell_monitor_rt_firmware_get_fw_version(fw_container));
-
-	/* SAFETY GUARD — refuse to issue any device IO unless fwupd has
-	 * tagged us as emulated. During development we can only run against
-	 * the captured fixture; real-hardware writes risk bricking the
-	 * monitor (the bootloader-entry trigger especially). The guard fires
-	 * specifically because our existing converter-produced fixture is in
-	 * FuUsbDevice format while our plugin attaches to a FuHidrawDevice,
-	 * so emulation-load builds a synthetic FuUsbDevice that our plugin
-	 * never sees — the device our plugin DOES see stays real, with the
-	 * EMULATED flag clear, and any IO falls through to /dev/hidrawN.
-	 * Lift this guard once we have either (a) a fixture in matching
-	 * FuHidrawDevice format with a BackendId that lines up with the
-	 * real device's sysfs path, captured via fwupdtool emulation-tag +
-	 * emulation-save, or (b) explicit user opt-in for real-hardware
-	 * testing once we trust the protocol. */
-	if (!fu_device_has_flag(device, FWUPD_DEVICE_FLAG_EMULATED)) {
-		g_set_error_literal(error,
-				    FWUPD_ERROR,
-				    FWUPD_ERROR_NOT_SUPPORTED,
-				    "dell-monitor-rt write_firmware refuses to run "
-				    "against real hardware until the bootloader / "
-				    "block-write / commit protocol is fully "
-				    "validated under emulation. Re-emulate with a "
-				    "fixture whose BackendId matches this device "
-				    "and FWUPD_DEVICE_FLAG_EMULATED will be set.");
-		return FALSE;
-	}
 
 	/* Pre-validation — walk every component, classify, and bail
 	 * BEFORE any IO if any routable component's chip class is
