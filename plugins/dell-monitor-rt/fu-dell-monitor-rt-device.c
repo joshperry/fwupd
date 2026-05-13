@@ -91,13 +91,16 @@ static const guint8 DELL_MONITOR_RT_U4025QW_SYNKEY_SEED[18] = {
 #define DELL_MONITOR_RT_I2C_LOADER_FRAME   (2 + DELL_MONITOR_RT_I2C_LOADER_CHUNK)
 
 /* Per-target session-init bytes for the i2c-tunnel ISP loader.
- * Decoded from captured trace + RTS5409s_IIC_API class behavior:
- *   WAKE  (5 bytes) — first c6 to a fresh i2c-tunnel target; primes
- *                     the downstream MCU's ISP loader.
- *   BEGIN (3 bytes) — second c6 to the same target; signals start of
- *                     chunked firmware transfer.
- * Both are followed by a single 1-byte readiness poll. */
-#define DELL_MONITOR_RT_I2C_LOADER_WAKE  { 0x25, 0x03, 0x00, 0x00, 0x02 }
+ * Decoded from libhub.c::Rts5409s_IIC_ISP::program — the only init
+ * step before the chunk loop is `clear_address` (3 bytes), aliased
+ * BEGIN here. The captured trace also contains a leading
+ * `25 03 00 00 02` "WAKE" sequence, but that's emitted by
+ * `Rts5409s_IIC_API::read_fw_version` (libhub.c:50641), a separate
+ * dlsym entry the main updater binary calls before program() to
+ * read back the existing flash version — it is NOT part of the
+ * program() flow itself, and replaying it from the chunk-loader
+ * leaves the chip in an unexpected state at chunk 0 (AUDIT.md F2.1).
+ * Followed by a single 1-byte readiness poll. */
 #define DELL_MONITOR_RT_I2C_LOADER_BEGIN { 0x12, 0x01, 0x01 }
 
 /* Per-chunk polling parameters for the i2c-tunnel ISP loader.
@@ -1450,15 +1453,25 @@ fu_dell_monitor_rt_device_i2c_tunnel_init_step(FuDellMonitorRtDevice *self,
  * tunnel (opcode 0xC6). Used for HUB1 → 0xD4 and HUB2 → 0xD6 — both
  * fire BEFORE bootloader entry, both go through HID-A.
  *
- * Per-target session sequence:
- *   1. WAKE  (`25 03 00 00 02`, 5 bytes)  + 1-byte poll
- *   2. BEGIN (`12 01 01`, 3 bytes)        + 1-byte poll
- *   3. For each 64-byte chunk:
+ * Per-target session sequence (matches Rts5409s_IIC_ISP::program in
+ * libhub.c, post-AUDIT F2.1):
+ *   1. clear_address (`12 01 01`, 3 bytes) + 1-byte poll
+ *   2. For each 64-byte chunk:
  *        c6 frame `13 40 <64 bytes>` + 1-byte poll until ready
  *
- * Verified bytewise against the captured pcap: HUB1.fw is 2048 chunks
- * to slave 0xD4, HUB2.fw is 1024 chunks to slave 0xD6, both preceded
- * by the same WAKE+BEGIN init.
+ * The captured pcap has a leading `25 03 00 00 02` "WAKE" + poll +
+ * 3-byte read_seq cycle that we previously emitted here without the
+ * read. That cycle is `Rts5409s_IIC_API::read_fw_version`
+ * (libhub.c:50641), called from the main updater binary BEFORE
+ * program() to display the existing version. It is not part of
+ * program() itself, and replaying just the write+poll without the
+ * matching 3-byte read leaves the chip in an unexpected state when
+ * chunk 0 arrives — confirmed leading cause of the live HUB1
+ * chunk-0 failure on real hardware (AUDIT.md F2.1).
+ *
+ * Verified bytewise against the captured pcap (with the read_fw_version
+ * cycles separated): HUB1.fw is 2048 chunks to slave 0xD4, HUB2.fw
+ * is 1024 chunks to slave 0xD6.
  *
  * cal_auth: The single cal_auth handshake performed by our caller
  * covers the entire blob. Decomp evidence (hub_handshake() in
@@ -1473,7 +1486,6 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 					       FuProgress *progress,
 					       GError **error)
 {
-	const guint8 wake[] = DELL_MONITOR_RT_I2C_LOADER_WAKE;
 	const guint8 begin[] = DELL_MONITOR_RT_I2C_LOADER_BEGIN;
 	const guint8 *blob_data;
 	gsize blob_size;
@@ -1495,14 +1507,7 @@ fu_dell_monitor_rt_device_stage_downstream_mcu(FuDellMonitorRtDevice *self,
 
 	if (!fu_dell_monitor_rt_device_i2c_tunnel_init_step(self,
 							    i2c_target,
-							    "WAKE",
-							    wake,
-							    sizeof(wake),
-							    error))
-		return FALSE;
-	if (!fu_dell_monitor_rt_device_i2c_tunnel_init_step(self,
-							    i2c_target,
-							    "BEGIN",
+							    "clear_address",
 							    begin,
 							    sizeof(begin),
 							    error))
