@@ -2549,6 +2549,19 @@ fu_dell_monitor_rt_device_display_f3_wait_ready(FuDellMonitorRtDevice *self,
 #define DELL_MONITOR_RT_RTKPANEL_BLOCK_SIZE       0x10000 /* 64 KB */
 #define DELL_MONITOR_RT_RTKPANEL_CRC_64K_ERASED   0xDE /* CRC8 of 65536 0xFFs */
 
+/* Validity-marker register + value. After the per-block stage+commit
+ * loop completes, Wistron writes a 2-byte `AA 55` marker into the
+ * SPI-data port at register 0x70, with the SPI target address pre-
+ * loaded to 0x3FF8FE via the same ADDR_HI/MID/LO registers used by
+ * the per-block writes. The panel scaler's bootloader reads this
+ * byte at boot to flag the new firmware as valid (AUDIT.md F6.3,
+ * libdisplay.c::secure_program_rtk @ 67296+). Pcap-confirmed at
+ * frame 811742 with the i2c-tunnel payload `70 AA 55`. */
+#define DELL_MONITOR_RT_RTKPANEL_REG_SPI_WRITE_PORT 0x70
+#define DELL_MONITOR_RT_RTKPANEL_VALIDITY_ADDR      0x3FF8FE
+#define DELL_MONITOR_RT_RTKPANEL_VALIDITY_LO        0xAA
+#define DELL_MONITOR_RT_RTKPANEL_VALIDITY_HI        0x55
+
 #define DELL_MONITOR_RT_RTKPANEL_BUSY_RETRIES     1024
 #define DELL_MONITOR_RT_RTKPANEL_BUSY_SLEEP_US    500
 
@@ -3503,6 +3516,57 @@ fu_dell_monitor_rt_device_display_program(FuDellMonitorRtDevice *self,
 		if (progress != NULL)
 			fu_progress_step_done(progress);
 	}
+
+	/* Post-loop validity marker write (AUDIT.md F6.3). Wistron's
+	 * `secure_program_rtk` (libdisplay.c:67296) ends with a 2-byte
+	 * `AA 55` write to register 0x70 with the SPI target address
+	 * pre-loaded to 0x3FF8FE — the panel scaler's bootloader reads
+	 * this marker at boot to decide whether the freshly-flashed
+	 * firmware is valid. Without this, the new firmware is treated
+	 * as invalid and the chip falls back to the old image. Pcap-
+	 * confirmed at frame 811742. */
+	{
+		const guint8 addr_hi = (DELL_MONITOR_RT_RTKPANEL_VALIDITY_ADDR >> 16) & 0xFF;
+		const guint8 addr_mid = (DELL_MONITOR_RT_RTKPANEL_VALIDITY_ADDR >> 8) & 0xFF;
+		const guint8 addr_lo = DELL_MONITOR_RT_RTKPANEL_VALIDITY_ADDR & 0xFF;
+		const guint8 marker_wire[3] = {
+		    DELL_MONITOR_RT_RTKPANEL_REG_SPI_WRITE_PORT,
+		    DELL_MONITOR_RT_RTKPANEL_VALIDITY_LO,
+		    DELL_MONITOR_RT_RTKPANEL_VALIDITY_HI,
+		};
+		const struct {
+			guint8 reg;
+			guint8 val;
+		} addr_writes[] = {
+		    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_HI, addr_hi},
+		    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_MID, addr_mid},
+		    {DELL_MONITOR_RT_RTKPANEL_REG_ADDR_LO, addr_lo},
+		};
+		for (gsize k = 0; k < G_N_ELEMENTS(addr_writes); k++) {
+			if (!fu_dell_monitor_rt_device_rtkpanel_write_reg(
+				self,
+				addr_writes[k].reg,
+				addr_writes[k].val,
+				error)) {
+				g_prefix_error(error,
+					       "DISPLAY validity-marker addr setup "
+					       "(reg 0x%02x): ",
+					       addr_writes[k].reg);
+				return FALSE;
+			}
+		}
+		if (!fu_dell_monitor_rt_device_i2c_write_speed(
+			self,
+			DELL_MONITOR_RT_RTKPANEL_I2C_TARGET,
+			DELL_MONITOR_RT_I2C_SPEED_FAST,
+			marker_wire,
+			sizeof(marker_wire),
+			error)) {
+			g_prefix_error(error, "DISPLAY validity-marker write: ");
+			return FALSE;
+		}
+	}
+
 	return TRUE;
 }
 
