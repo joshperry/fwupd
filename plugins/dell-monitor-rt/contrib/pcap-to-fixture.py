@@ -641,15 +641,32 @@ def specialize(intermediate_zip: str, output_zip: str) -> None:
             # walks past the install-phase event list and wraps to 0
             # for the reload events at the next read (fu-device.c
             # "no more events, looping" path).
-            if reload_evs:
-                reload_dev = {k: v for k, v in dev.items() if k != "Events"}
-                reload_dev["Events"] = reload_evs
-                reload_devs.append(reload_dev)
+            reload_dev = {k: v for k, v in dev.items() if k != "Events"}
+            reload_dev["Events"] = reload_evs
+            reload_devs.append(reload_dev)
         else:
             # Child: full event stream in setup.json only.
             setup_dev = {k: v for k, v in dev.items() if k != "Events"}
             setup_dev["Events"] = list(dev.get("Events", []))
             setup_devs.append(setup_dev)
+            # Child gets a tombstone entry (same BackendId + Created,
+            # empty events list) in every phase that re-loads the
+            # backend's device universe. Without this, fu-backend.c's
+            # from_json runs its "devices not present in this phase's
+            # JSON" → device_removed path against the child, removes it
+            # from the backend list while the primary still holds a
+            # strong ref to it via fu_device_add_child, and the
+            # resulting lifecycle confusion crashes fwupdtool during
+            # final shutdown (FuDeviceList's weak refs go stale on the
+            # orphaned child). Same-(BackendId, Created) matches the
+            # existing child via the device_changed merge path with no
+            # behavior change beyond keeping the child enumerated.
+            install_dev = {k: v for k, v in dev.items() if k != "Events"}
+            install_dev["Events"] = []
+            install_devs.append(install_dev)
+            reload_dev = {k: v for k, v in dev.items() if k != "Events"}
+            reload_dev["Events"] = []
+            reload_devs.append(reload_dev)
 
     setup_phase = _build_phase(setup_devs)
     install_phase = _build_phase(install_devs)
