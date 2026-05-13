@@ -2088,6 +2088,47 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 	if (progress != NULL)
 		fu_progress_set_steps(progress, nchunks + 4);
 
+	/* (0) Read BootFlags82 (register 0x2D, 2 bytes LE). Mirrors
+	 * Tps6598xISP::FWUpdate82 at libpdc.c:50768. AUDIT.md F5.5 —
+	 * partial implementation: we log the bits for diagnostics, but
+	 * we do NOT gate on BootOk. Wistron's gate is comparison-based
+	 * (`(BootFlags82 & 1) != (this->flags >> 4 & 1)`), comparing
+	 * the chip's BootOk bit against an EXPECTED value sourced from
+	 * the chip-config struct (which we'd need plumbed from .upg
+	 * metadata). For a chip in post-bootloader ISP mode BootOk=0
+	 * is the expected state — the chip is running ISP code, not
+	 * user firmware — so an absolute BootOk==1 check would falsely
+	 * refuse the captured U4025QW path (which has BootFlags82=0x0018,
+	 * BootOk=0). Full gating + two-region dispatch is F5.2,
+	 * deferred until .upg's low_region_only field is plumbed. */
+	{
+		guint8 bootflags[2] = {0};
+		if (!fu_dell_monitor_rt_pdc_read_resp(self,
+						      0x2D, /* BootFlags82 */
+						      sizeof(bootflags),
+						      bootflags,
+						      sizeof(bootflags),
+						      error)) {
+			g_prefix_error(error, "PDC BootFlags82 read: ");
+			return FALSE;
+		}
+		g_info("dell-monitor-rt: PDC BootFlags82 = 0x%02x%02x "
+		       "(BootOk=%u, R0_attempted=%u, R0_invalid=%u, "
+		       "R1_attempted=%u, R1_invalid=%u, "
+		       "R0_flash_err=%u, R0_crc_fail=%u, "
+		       "R1_flash_err=%u, R1_crc_fail=%u)",
+		       bootflags[1], bootflags[0],
+		       bootflags[0] & 1,
+		       (bootflags[0] >> 4) & 1,
+		       (bootflags[0] >> 6) & 1,
+		       (bootflags[0] >> 5) & 1,
+		       (bootflags[0] >> 7) & 1,
+		       bootflags[1] & 1,
+		       (bootflags[1] >> 4) & 1,
+		       (bootflags[1] >> 1) & 1,
+		       (bootflags[1] >> 5) & 1);
+	}
+
 	/* (1) FLrr(R0): discover Region 0's flash base address.
 	 * The chip returns 4 bytes (LE address). We use this as the
 	 * write/erase base — DON'T hardcode per-product. */
@@ -2111,6 +2152,23 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 			    FWUPD_ERROR_INVALID_DATA,
 			    "PDC FLrr returned suspicious region base 0x%08x",
 			    base);
+		return FALSE;
+	}
+	/* AUDIT.md F5.6: defensive check for the `0x100e0ac` magic.
+	 * Wistron's RegionUpdate82 at libpdc.c:50442 treats this
+	 * specific value as "Low-Region File found with offset 0x0 —
+	 * not a valid 2-region flash image"; flagged with an explicit
+	 * ABORT log. Half-initialized chips from a prior botched flash
+	 * may report this. */
+	if (base == 0x0100E0AC) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_INVALID_DATA,
+				    "PDC FLrr returned 0x0100E0AC — chip is "
+				    "in a half-initialized state (Low-Region "
+				    "file at offset 0x0). A prior install "
+				    "likely aborted mid-flash; recovery via "
+				    "Wistron's tooling required");
 		return FALSE;
 	}
 	base_le[0] = (guint8)(base & 0xFF);
@@ -3314,17 +3372,38 @@ fu_dell_monitor_rt_device_rtkpanel_setup(FuDellMonitorRtDevice *self,
 		return FALSE;
 	}
 	/* Initial erase at (flash_end_index << 16). Reuses the per-block
-	 * helper, which also CRC-verifies the result. */
-	if (!fu_dell_monitor_rt_device_rtkpanel_erase_and_verify_64k(
-		self,
-		flash_end_index << 16,
-		error)) {
-		g_prefix_error(error,
-			       "rtkpanel setup: initial erase at 0x%08x: ",
-			       (guint)(flash_end_index << 16));
+	 * helper, which also CRC-verifies the result.
+	 *
+	 * AUDIT.md F6.1: 3-attempt retry, matching RealtekISP::secure_
+	 * program_rtk's preamble at libdisplay.c:67012 — `do { ... }
+	 * while (++uVar14 != 4)` around spi_unit_erase. The retry covers
+	 * transient SPI flash busy/timeout conditions. */
+	{
+		const guint max_attempts = 3;
+		g_autoptr(GError) last_error = NULL;
+		for (guint attempt = 0; attempt < max_attempts; attempt++) {
+			g_autoptr(GError) attempt_error = NULL;
+			if (fu_dell_monitor_rt_device_rtkpanel_erase_and_verify_64k(
+				self,
+				flash_end_index << 16,
+				&attempt_error))
+				return TRUE;
+			g_clear_error(&last_error);
+			last_error = g_steal_pointer(&attempt_error);
+			g_debug("rtkpanel setup: initial erase attempt "
+				"%u/%u failed: %s",
+				attempt + 1,
+				max_attempts,
+				last_error->message);
+		}
+		g_propagate_prefixed_error(
+		    error,
+		    g_steal_pointer(&last_error),
+		    "rtkpanel setup: initial erase at 0x%08x failed after %u attempts: ",
+		    (guint)(flash_end_index << 16),
+		    max_attempts);
 		return FALSE;
 	}
-	return TRUE;
 }
 
 /*
@@ -3564,15 +3643,44 @@ fu_dell_monitor_rt_device_display_program(FuDellMonitorRtDevice *self,
 		fu_progress_set_steps(progress, nblocks);
 	}
 
+	/* AUDIT.md F6.2: 3-attempt retry around each per-block call,
+	 * matching RealtekISP::secure_program_rtk's main loop:
+	 * `uVar14 = 3; do { ... } while (uVar14 != 0)`. Each attempt is
+	 * the full F4/F1/04/F5 commit sequence; transient SPI errors
+	 * (busy / verify-mismatch) get a re-try before bubbling up. */
 	for (guint i = 0; i < nblocks; i++) {
 		const guint8 *block = blob_data + i * DELL_MONITOR_RT_DISPLAY_BLOCK_SIZE;
-		if (!fu_dell_monitor_rt_device_display_program_block(
-			self,
-			block,
-			global_pubkey,
-			flash_start_index,
-			error)) {
-			g_prefix_error(error, "DISPLAY block %u/%u: ", i, nblocks);
+		const guint max_attempts = 3;
+		g_autoptr(GError) last_error = NULL;
+		gboolean ok = FALSE;
+		for (guint attempt = 0; attempt < max_attempts; attempt++) {
+			g_autoptr(GError) attempt_error = NULL;
+			if (fu_dell_monitor_rt_device_display_program_block(
+				self,
+				block,
+				global_pubkey,
+				flash_start_index,
+				&attempt_error)) {
+				ok = TRUE;
+				break;
+			}
+			g_clear_error(&last_error);
+			last_error = g_steal_pointer(&attempt_error);
+			g_debug("DISPLAY block %u/%u attempt %u/%u: %s",
+				i,
+				nblocks,
+				attempt + 1,
+				max_attempts,
+				last_error->message);
+		}
+		if (!ok) {
+			g_propagate_prefixed_error(
+			    error,
+			    g_steal_pointer(&last_error),
+			    "DISPLAY block %u/%u failed after %u attempts: ",
+			    i,
+			    nblocks,
+			    max_attempts);
 			return FALSE;
 		}
 		if (progress != NULL)
