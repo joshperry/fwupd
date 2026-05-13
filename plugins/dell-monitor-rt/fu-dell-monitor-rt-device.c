@@ -1138,10 +1138,16 @@ fu_dell_monitor_rt_device_commit_isp_tag(FuDellMonitorRtDevice *self,
 			       version);
 		return FALSE;
 	}
-	/* Settle delay matches the cadence in the recap (~50 ms between
-	 * write and response read for our existing read_panel_id /
-	 * read_isp_tag pairs). */
-	g_usleep(50 * 1000);
+	/* Settle delay — the chip needs ~1 second to process an IspTag
+	 * write: for "#ISP#" it's announcement-record latency; for "#CHK#"
+	 * it's a full PDC firmware signature verification. The recap
+	 * shows ~1.003 s between every IspTag write and its response
+	 * read (frames 7230→7232, 7264→7276, 290306→290854), which
+	 * matches Wistron's "extra %ds delay for IspTag command" log
+	 * (firmware-updater.c FUN_00317d00). 1.5 s gives margin while
+	 * still being short enough that real-HW installs complete in a
+	 * reasonable time (3 IspTag writes × 1.5 s = 4.5 s total). */
+	g_usleep(1500 * 1000);
 	/* Drain the chip's 64-byte response. We don't validate the
 	 * contents — without decoding the response format we'd rather
 	 * not gate the install on bytes we don't understand. The read
