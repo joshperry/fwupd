@@ -1004,6 +1004,69 @@ fu_dell_monitor_rt_device_read_isptag(FuDellMonitorRtDevice *self,
 }
 
 /*
+ * Read VCP 0xCC via DDC/CI on slave 0x6e.
+ *
+ * Wistron's recap shows this read fires between PDC's last 4CC
+ * command and the post-PDC "#CHK#" IspTag write — a tightly-bounded
+ * 3-event probe (i2c-W cnt=7 + i2c-R cnt=64 + Ioctl). The chip's
+ * response bytes are ignored by the host; the read appears to act
+ * as a state-transition trigger rather than carrying meaningful
+ * data. Without this read, our subsequent "#CHK#" still gets a
+ * byte-identical chip response (PDC verify succeeds), but DISPLAY
+ * block 0's secure_control_gpio commit STALLs with EPIPE on real
+ * hardware. Hypothesis: this read is what actually arms the chip's
+ * secure subsystem to permit DISPLAY's protected commit, and #CHK#
+ * just records the new version after the fact.
+ *
+ * Wire format mirrors read_isp_tag / read_panel_id:
+ *
+ *   51 84 c0 99 cc 20 0e
+ *   │  │  └────┬───┘  └─ XOR checksum over 0x6e (dest) || all preceding
+ *   │  length: 0x80 | 4
+ *   src addr (host = 0x51)
+ */
+static gboolean
+fu_dell_monitor_rt_device_read_vcp_cc(FuDellMonitorRtDevice *self, GError **error)
+{
+	const guint8 i2c_request[7] = {
+	    0x51, 0x84, 0xc0, 0x99, 0xcc, 0x20, 0x0e,
+	};
+	guint8 response[DELL_MONITOR_RT_BUF_SIZE] = {0};
+	guint8 hub_key[8];
+
+	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
+				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
+				      hub_key);
+	if (!fu_dell_monitor_rt_device_session_open(self, hub_key, error)) {
+		g_prefix_error(error, "VCP 0xCC session_open: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_i2c_write(self,
+						 DELL_MONITOR_RT_I2C_TARGET_DDCCI,
+						 i2c_request,
+						 sizeof(i2c_request),
+						 error)) {
+		g_prefix_error(error, "VCP 0xCC write: ");
+		return FALSE;
+	}
+	g_usleep(50 * 1000);
+	if (!fu_dell_monitor_rt_device_i2c_read(self,
+						DELL_MONITOR_RT_I2C_TARGET_DDCCI,
+						0x40,
+						response,
+						sizeof(response),
+						error)) {
+		g_prefix_error(error, "VCP 0xCC response drain: ");
+		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_session_close(self, hub_key, error)) {
+		g_prefix_error(error, "VCP 0xCC session_close: ");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/*
  * Read the panel id from the FL5500 scaler via DDC/CI VCP 0xEE.
  *
  * Each panel SKU gets its own scaler firmware build, so the scaler's
@@ -4626,13 +4689,22 @@ fu_dell_monitor_rt_proto_pdc_stage(FuDellMonitorRtDevice *target,
 	if (!fu_dell_monitor_rt_device_pdc_program(target, blob, NULL, error))
 		return FALSE;
 
+	/* Post-PDC: read VCP 0xCC. Wistron emits this in its own
+	 * session bracket between PDC's last 4CC and the #CHK# write.
+	 * Empirically this read is what arms the chip's secure
+	 * subsystem to permit DISPLAY's secure_control_gpio commit
+	 * later — without it, our subsequent #CHK# still gets a
+	 * byte-identical chip response (PDC verify succeeds), but
+	 * DISPLAY block 0's 0x04 STALLs with EPIPE on real hardware. */
+	if (!fu_dell_monitor_rt_device_read_vcp_cc(target, error)) {
+		g_prefix_error(error, "post-PDC VCP 0xCC probe: ");
+		return FALSE;
+	}
+
 	/* Post-PDC commit: write "#CHK#<install_version>#" to VCP 0xAD.
-	 * This triggers the chip's signature verification of the just-
-	 * staged PDC firmware (recap frame 290306). Without it, DISPLAY
-	 * block 0's 0x04 secure_control_gpio commit STALLs because the
-	 * chip refuses to enable the secure flash GPIO while an
-	 * unverified PDC sits in the spare bank. The install_version
-	 * was cached on the device by write_firmware. */
+	 * Records the new firmware version after the chip-side verify
+	 * completes (recap frame 290306). The install_version was
+	 * cached on the device by write_firmware. */
 	install_version =
 	    fu_device_get_metadata(FU_DEVICE(target),
 				   "dell-monitor-rt:install-version");
