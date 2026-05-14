@@ -2157,12 +2157,59 @@ fu_dell_monitor_rt_device_enter_bootloader(FuDellMonitorRtDevice *self,
 #define DELL_MONITOR_RT_PDC_ACK_BYTES 4
 #define DELL_MONITOR_RT_PDC_DATA_BYTES 16
 
+/* Sleep constants from libpdc.so::TPS6598X_API::fourCC_Command.
+ * Values verified by reading the timespec literals at vaddr 0x193fe0..0x194010
+ * in the binary (rodata, all tv_sec=0):
+ *
+ *   PRE_CMD_MS  = 40 ms (vaddr 0x193fe0) — entry-of-fourCC settling and
+ *                 inter-poll period; chip needs this to deassert/settle
+ *                 between any pair of i2c ops to its register interface.
+ *   FLWD_INTER_WRITE_MS = 50 ms (vaddr 0x193ff0) — between Data1 write
+ *                 (32-byte chunk) and Cmd1 write ("FLwd"). Only the FLwd
+ *                 4CC has this — other commands write Data1 then Cmd1
+ *                 back-to-back. Chip needs the gap to internally latch the
+ *                 chunk before flash programming begins.
+ *   POST_CMD_MS = 5 ms (vaddr 0x194000) — after writing Cmd1 for FLwd
+ *                 and FLrd, before starting the Cmd1 poll. Lets the chip
+ *                 transition Cmd1 from "ready to accept" to "in-flight".
+ *   FLVY_POST_CMD_MS = 200 ms (vaddr 0x194010) — same role as POST_CMD_MS
+ *                 but for FLvy (Flash Verify), which scans the entire region.
+ *
+ * We were missing all three of these waits originally — that's why our
+ * PDC phase took ~30 s vs Wistron's ~8 min on the same hardware. The
+ * chip's Cmd1 register *does* clear early under our racing flow, but the
+ * underlying flash programming is silently incomplete. The chip's #CHK#
+ * verify "succeeds" because it verifies what made it into flash, but the
+ * staged image is bad — DISPLAY's downstream secure_control_gpio commit
+ * then STALLs because the secure subsystem detected the bad PDC.
+ */
+#define DELL_MONITOR_RT_PDC_PRE_CMD_MS	      40
+#define DELL_MONITOR_RT_PDC_FLWD_INTER_WRITE_MS 50
+#define DELL_MONITOR_RT_PDC_POST_CMD_MS	      5
+#define DELL_MONITOR_RT_PDC_FLVY_POST_CMD_MS  200
+
+/* Helper: skip-under-EMULATED sleep. Synthetic emulation fixtures have
+ * no real flash and would just slow tests for nothing. */
+static inline void
+fu_dell_monitor_rt_pdc_settling_sleep(FuDellMonitorRtDevice *self, guint ms)
+{
+	if (ms == 0)
+		return;
+	if (fu_device_has_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_EMULATED))
+		return;
+	g_usleep((gulong)ms * 1000);
+}
+
 /*
  * Write `len` bytes into TPS6598x register 0x08 (Data1) — the input
  * buffer for whatever 4CC command will be issued next. The on-wire
  * payload is `08 LL <data>`; the i2c-tunnel slave is 0x42 (PDC).
  * Caller's responsibility: a valid cal_auth handshake before the
  * first call in a session.
+ *
+ * Sleeps PRE_CMD_MS (40 ms) before writing — this is the
+ * entry-of-fourCC_Command settling pause from libpdc.c:48793, applied
+ * here because every 4CC sequence starts with set_buf.
  */
 static gboolean
 fu_dell_monitor_rt_pdc_set_buf(FuDellMonitorRtDevice *self,
@@ -2171,6 +2218,7 @@ fu_dell_monitor_rt_pdc_set_buf(FuDellMonitorRtDevice *self,
 			       GError **error)
 {
 	g_autofree guint8 *payload = NULL;
+	fu_dell_monitor_rt_pdc_settling_sleep(self, DELL_MONITOR_RT_PDC_PRE_CMD_MS);
 	if (len > 64) {
 		g_set_error(error,
 			    FWUPD_ERROR,
@@ -2200,11 +2248,20 @@ fu_dell_monitor_rt_pdc_set_buf(FuDellMonitorRtDevice *self,
  * Issue a 4CC command on TPS6598x register 0x09 (Cmd1). cmd_str must
  * be exactly 2 ASCII chars (the "<c1><c2>" tail of "FL<c1><c2>").
  * On-wire payload: `09 04 46 4c <c1> <c2>`.
+ *
+ * Sleeps inter_write_ms BEFORE issuing the Cmd1 write (between the
+ * preceding Data1 buffer write and this Cmd1 write — only FLwd needs
+ * non-zero here per libpdc.c:48803), and post_cmd_ms AFTER (for the
+ * chip to transition Cmd1 from "ready" to "in-flight" before the
+ * Cmd1 poll begins — 5 ms for FLwd/FLrd, 200 ms for FLvy, 0 for
+ * the others; libpdc.c:48813/48841/48862).
  */
 static gboolean
-fu_dell_monitor_rt_pdc_cmd(FuDellMonitorRtDevice *self,
-			   const gchar *cmd_str,
-			   GError **error)
+fu_dell_monitor_rt_pdc_cmd_with_sleeps(FuDellMonitorRtDevice *self,
+				       const gchar *cmd_str,
+				       guint inter_write_ms,
+				       guint post_cmd_ms,
+				       GError **error)
 {
 	guint8 payload[6];
 	if (cmd_str == NULL || strlen(cmd_str) != 2) {
@@ -2215,6 +2272,7 @@ fu_dell_monitor_rt_pdc_cmd(FuDellMonitorRtDevice *self,
 			    cmd_str != NULL ? cmd_str : "(null)");
 		return FALSE;
 	}
+	fu_dell_monitor_rt_pdc_settling_sleep(self, inter_write_ms);
 	payload[0] = DELL_MONITOR_RT_PDC_REG_CMD1;
 	payload[1] = 0x04;	     /* command length */
 	payload[2] = 0x46;	     /* 'F' */
@@ -2230,7 +2288,54 @@ fu_dell_monitor_rt_pdc_cmd(FuDellMonitorRtDevice *self,
 		g_prefix_error(error, "PDC FL%s issue: ", cmd_str);
 		return FALSE;
 	}
+	fu_dell_monitor_rt_pdc_settling_sleep(self, post_cmd_ms);
 	return TRUE;
+}
+
+/* Per-cmd sleep table from libpdc.c::TPS6598X_API::fourCC_Command.
+ * Returns the inter-write sleep (between Data1 and Cmd1) and post-cmd
+ * sleep (between Cmd1 and the start of the Cmd1 poll). */
+static void
+fu_dell_monitor_rt_pdc_cmd_sleeps(const gchar *cmd_str,
+				  guint *inter_write_ms_out,
+				  guint *post_cmd_ms_out)
+{
+	guint inter_write = 0;
+	guint post = 0;
+	if (g_strcmp0(cmd_str, "wd") == 0) {
+		/* FLwd path (libpdc.c:48803, 48813) — chip needs the 50 ms
+		 * gap to internally latch the chunk before flash programming. */
+		inter_write = DELL_MONITOR_RT_PDC_FLWD_INTER_WRITE_MS;
+		post = DELL_MONITOR_RT_PDC_POST_CMD_MS;
+	} else if (g_strcmp0(cmd_str, "rd") == 0) {
+		/* FLrd path (libpdc.c:48841) — no inter-write gap. */
+		post = DELL_MONITOR_RT_PDC_POST_CMD_MS;
+	} else if (g_strcmp0(cmd_str, "vy") == 0) {
+		/* FLvy path (libpdc.c:48862) — long post-cmd; FLvy walks the
+		 * entire region before clearing Cmd1. */
+		post = DELL_MONITOR_RT_PDC_FLVY_POST_CMD_MS;
+	}
+	/* FLad / FLrr / FLem fall through with both = 0. */
+	if (inter_write_ms_out != NULL)
+		*inter_write_ms_out = inter_write;
+	if (post_cmd_ms_out != NULL)
+		*post_cmd_ms_out = post;
+}
+
+/* Convenience wrapper: looks up the per-command sleeps and issues. */
+static gboolean
+fu_dell_monitor_rt_pdc_cmd(FuDellMonitorRtDevice *self,
+			   const gchar *cmd_str,
+			   GError **error)
+{
+	guint inter_write_ms = 0;
+	guint post_cmd_ms = 0;
+	fu_dell_monitor_rt_pdc_cmd_sleeps(cmd_str, &inter_write_ms, &post_cmd_ms);
+	return fu_dell_monitor_rt_pdc_cmd_with_sleeps(self,
+						      cmd_str,
+						      inter_write_ms,
+						      post_cmd_ms,
+						      error);
 }
 
 /* Read `count` bytes from a TPS6598x register. The i2c-tunnel does the
