@@ -2278,6 +2278,85 @@ fu_dell_monitor_rt_pdc_read_resp(FuDellMonitorRtDevice *self,
 	return TRUE;
 }
 
+/* Poll Cmd1 (register 0x08) until the chip's flash controller signals
+ * the in-flight 4CC command has completed. Mirrors the do/while loop
+ * in TPS6598X_API::fourCC_Command at libpdc.c:48905 (LAB_00197f80):
+ *
+ *   do {
+ *       nanosleep(40 ms);
+ *       read register 0x08, len 5;
+ *       status = bytes[1..5] as little-endian u32;
+ *   } while (status != 0 && status != 0x444d4321);
+ *
+ * Cmd1's value evolves as the chip processes the command:
+ *   - immediately after Cmd1 write: holds the just-written 4CC opcode
+ *     (e.g., 0x64774c46 = "FLwd")
+ *   - while the chip is processing: stays at the opcode (busy)
+ *   - on success: transitions to 0x00000000
+ *   - on error: transitions to 0x444d4321 ("!CMD")
+ *
+ * We previously read Cmd1 ONCE and didn't check the value. On a
+ * healthy fast chip the first read happens to land after completion
+ * and we're fine; on a busy chip (PDC's flash writes take ~40-900 ms
+ * each) we proceed before the chip is ready and the staged firmware
+ * is silently corrupt. captures/u4025qw-failrun-20260513-194351.pcapng
+ * captured this on real hardware: PDC chunks landed at 29 ms cadence
+ * vs Wistron's 917 ms, and DISPLAY block 0's 0x04 secure_control_gpio
+ * commit STALLed because the chip's secure subsystem detected the
+ * bad PDC.
+ *
+ * Safety bound: 100 iterations × 40 ms = 4 s per command. The longest
+ * 4CC the recap shows is FLwd at ~917 ms; FLem (erase) might exceed
+ * 1 s under sector contention but should still finish well under 4 s.
+ */
+#define DELL_MONITOR_RT_PDC_CMD1_POLL_SLEEP_MS  40
+#define DELL_MONITOR_RT_PDC_CMD1_POLL_MAX_ITERS 100
+#define DELL_MONITOR_RT_PDC_CMD1_DONE_OK	0x00000000u
+#define DELL_MONITOR_RT_PDC_CMD1_DONE_BADCMD	0x444d4321u /* "!CMD" LE */
+
+static gboolean
+fu_dell_monitor_rt_pdc_poll_cmd1(FuDellMonitorRtDevice *self,
+				 guint32 *cmd1_status_out,
+				 GError **error)
+{
+	guint8 ack[DELL_MONITOR_RT_PDC_ACK_BYTES] = {0};
+	for (guint iter = 0; iter < DELL_MONITOR_RT_PDC_CMD1_POLL_MAX_ITERS; iter++) {
+		guint32 status;
+		/* Skip sleep entirely under emulation — synthetic
+		 * fixture has no real flash to settle. */
+		if (!fu_device_has_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_EMULATED))
+			g_usleep(DELL_MONITOR_RT_PDC_CMD1_POLL_SLEEP_MS * 1000);
+		if (!fu_dell_monitor_rt_pdc_read_resp(self,
+						      DELL_MONITOR_RT_PDC_REG_CMD1,
+						      DELL_MONITOR_RT_PDC_ACK_BYTES,
+						      ack,
+						      sizeof(ack),
+						      error)) {
+			g_prefix_error(error, "PDC Cmd1 poll iter %u: ", iter);
+			return FALSE;
+		}
+		/* Cmd1 layout per chip-side: byte 0 of the response is
+		 * the response-length nibble; the 4-byte status word
+		 * follows (little-endian). Our pdc_read_resp already
+		 * stripped the report-ID + width-byte prefix. */
+		status = (guint32)ack[0] | ((guint32)ack[1] << 8) |
+			 ((guint32)ack[2] << 16) | ((guint32)ack[3] << 24);
+		if (status == DELL_MONITOR_RT_PDC_CMD1_DONE_OK ||
+		    status == DELL_MONITOR_RT_PDC_CMD1_DONE_BADCMD) {
+			if (cmd1_status_out != NULL)
+				*cmd1_status_out = status;
+			return TRUE;
+		}
+	}
+	g_set_error(error,
+		    FWUPD_ERROR,
+		    FWUPD_ERROR_TIMED_OUT,
+		    "PDC Cmd1 didn't clear after %u × %u ms polls",
+		    DELL_MONITOR_RT_PDC_CMD1_POLL_MAX_ITERS,
+		    DELL_MONITOR_RT_PDC_CMD1_POLL_SLEEP_MS);
+	return FALSE;
+}
+
 /* Read both Cmd1 (ack/status) and Data1 (response data) registers — the
  * ack-then-data pair that follows every 4CC command. Pass NULL for
  * data_out if the command has no response data to consume. */
@@ -2287,15 +2366,22 @@ fu_dell_monitor_rt_pdc_finish_cmd(FuDellMonitorRtDevice *self,
 				  gsize data_count,
 				  GError **error)
 {
-	guint8 ack[DELL_MONITOR_RT_PDC_ACK_BYTES] = {0};
 	guint8 dummy[DELL_MONITOR_RT_PDC_ACK_BYTES] = {0};
-	if (!fu_dell_monitor_rt_pdc_read_resp(self,
-					      DELL_MONITOR_RT_PDC_REG_CMD1,
-					      DELL_MONITOR_RT_PDC_ACK_BYTES,
-					      ack,
-					      sizeof(ack),
-					      error))
+	guint32 cmd1_status = 0;
+	/* Poll Cmd1 until the chip signals the 4CC completed (success
+	 * or "!CMD" error). This is the wait the chip's flash controller
+	 * needs — we previously single-shotted the read and proceeded
+	 * regardless of value, racing the chip on every command. */
+	if (!fu_dell_monitor_rt_pdc_poll_cmd1(self, &cmd1_status, error))
 		return FALSE;
+	if (cmd1_status == DELL_MONITOR_RT_PDC_CMD1_DONE_BADCMD) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_SUPPORTED,
+				    "PDC chip rejected 4CC command (Cmd1 = "
+				    "\"!CMD\")");
+		return FALSE;
+	}
 	/* Always read Data1 too; Wistron's host code does this on every
 	 * 4CC, and the chip is happiest when the round-trip completes
 	 * (an internal busy/ready latch flips on the Data1 read). For
@@ -2606,35 +2692,8 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 	 * base+chunk_size..base+(nchunks-1)*chunk_size. Skips chunk 0
 	 * (the header); that goes last. Stops at chunk (nchunks-1) — we
 	 * do NOT emit Wistron's iter-(nchunks) past-end write.
-	 *
-	 * Per-chunk pacing: our op sequence per chunk is byte-for-byte
-	 * identical to Wistron's recap (16 ops: FLwd write+cmd+ack+data,
-	 * 2× FLrd verify, FLad for next chunk). But Wistron's wall-clock
-	 * cadence is ~917 ms/chunk (USB op latency on their QA machine
-	 * was ~55 ms each); ours is ~29 ms/chunk on signi (~1.8 ms per
-	 * USB op). Running 30× faster apparently outruns the TPS6598x's
-	 * flash controller — chip ACKs each i2c op (so our verify reads
-	 * the chip's i2c buffer correctly and matches) but the actual
-	 * flash write hasn't completed before the next FLwd arrives.
-	 * #CHK# returns byte-identical "OK" bytes to Wistron, but the
-	 * staged firmware is silently bad and DISPLAY's 0x04
-	 * secure_control_gpio commit STALLs because the chip's secure
-	 * subsystem detected the bad PDC.
-	 *
-	 * Match Wistron's observed cadence by sleeping ~900 ms per chunk
-	 * before the next FLwd issues. On real HW this makes PDC
-	 * programming take ~7 minutes (matches Wistron's QA timing).
-	 * Skipped under emulation since there's no real flash to
-	 * settle. captures/u4025qw-failrun-20260513-194351.pcapng for
-	 * the chunk-cycle byte-identical comparison.
 	 */
-	const guint pdc_chunk_pacing_us =
-	    fu_device_has_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_EMULATED)
-		? 0
-		: 900 * 1000;
 	for (guint i = 1; i < nchunks; i++) {
-		if (i > 1 && pdc_chunk_pacing_us > 0)
-			g_usleep(pdc_chunk_pacing_us);
 		guint32 addr = base + (guint32)(i * DELL_MONITOR_RT_PDC_CHUNK_SIZE);
 		const guint8 *src = blob_data + (i * DELL_MONITOR_RT_PDC_CHUNK_SIZE);
 		guint8 addr_le[4];
