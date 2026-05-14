@@ -8,6 +8,44 @@ plugin module-by-module against the Wistron source we recovered and
 records every divergence — what we do, what they do, why it matters,
 and how we fixed it.
 
+## ⚠ Audit reliability note (2026-05-13)
+
+The first pass of this audit (commits up to and including 80d404024)
+treated each section as a code-review: "does our function look like
+their function?" Several "match" entries were rubber-stamped without
+walking every chip-observable op the decomp emits. Real-hardware
+testing has since proven this approach wrong:
+
+- **Section 5.1 (PDC wire format) — was "match", actually missing
+  THREE settling sleeps + a Cmd1 poll loop.** Fixed in commits
+  8f28c363e (poll) + 80d404024 (sleeps).
+- **Section 5.7 (PDC open/close) — was "match", actually missing
+  the entire RTS5409S_HID open/close session bracket around PDC
+  programming.** Fixed in commit 2cb52e260 (session_open / session_close).
+- **Section 1.7 (RTS5409S_HID::close) — claimed "We don't do
+  graceful shutdown… fine on install path."** WRONG. The close
+  sequence is required mid-install between PDC and DISPLAY phases;
+  without it the chip's secure subsystem refuses subsequent secure
+  ops.
+- **Section 6 (DISPLAY) — claims "match (verified during initial
+  implementation)". Same risk pattern: pre-decomp implementation,
+  rubber-stamped post-hoc.** As of 2026-05-13 evening, real-hardware
+  tests still STALL at DISPLAY block 0's 0x04 secure_control_gpio
+  commit with EPIPE — chip disconnects when we issue 0x04. The
+  cause is NOT data corruption (we erase first, then write the same
+  bytes Wistron writes — F1 chunks are byte-identical against the
+  recap). The cause is something STRUCTURAL — chip state,
+  timing, or a missing secure-subsystem priming op — that is not
+  yet identified.
+
+A real audit walks every observable op (wire writes/reads, sleeps with
+constants, status checks, retry counts, error paths) in the decomp
+function, lists each, and verifies each in the plugin. "Looks fine"
+is not equivalence. Sections 1, 2, 3, 4 may also harbor undetected
+divergences; treat the original "match" verdicts there as unverified
+until a second-pass audit has been done with the discipline noted
+above.
+
 Order of attack:
 
 1. **setup / vendor commands** — `fu_dell_monitor_rt_device_setup` and
@@ -211,6 +249,44 @@ bytes)" — and if not, treat as transport failure.
 partial write or non-zero errno, exactly the same semantic.
 
 **Severity: match — equivalent partial-write detection.**
+
+### 1.7 setup-phase open-side flow — CORRECTION
+
+The original Section 1.7 claimed:
+
+> `RTS5409S_HID::close` (`libdevices.c:66541`) does graceful shutdown:
+> `hub_force_handshake` → `enable_high_clock_mode(false)` → `hid_close`.
+> We don't do graceful shutdown — the device is torn down by udev on
+> re-enumeration anyway, so this is fine on the install path.
+
+**That was wrong.** The close sequence (cal_auth + disable_high_clock)
+isn't just graceful-shutdown housekeeping — it's a chip-side state
+transition that the secure subsystem requires between privileged-op
+sessions. Without it, the chip nominally still has the previous
+session "open" and refuses subsequent secure ops (e.g. DISPLAY's
+0x04 secure_control_gpio commit).
+
+Verified by real-HW capture comparison
+(`captures/u4025qw-failrun-20260513-210753.pcapng` vs the recap):
+recap emits `40 e1 01 01` + `40 e1 03 00` + `40 06 00 00` (the close
+sequence) immediately after FLvy success. Our flow was skipping it
+and proceeding straight into the post-PDC VCP 0xCC read. Symptom:
+DISPLAY block 0's 0x04 STALLs with EPIPE (chip refuses the secure op
+because the PDC session is still nominally open).
+
+Fixed in commit 2cb52e260 by wrapping pdc_program in
+session_open / session_close (the open path adds enable_vdcmd +
+enable_high_clock + cal_auth; the close path adds cal_auth +
+disable_high_clock). The session bracket pattern matches
+`RTS5409S_HID::open()` (libdevices.c:66951) and
+`RTS5409S_HID::close()` (libdevices.c:66554) explicitly.
+
+This finding ALSO implies that any other privileged-op sequence in
+the plugin (DISPLAY block writes, c8 staging, HUB1/HUB2 i2c-tunnel
+flash) needs to be wrapped in the same session bracket. The DISPLAY
+phase already has its own session_open/close (line 4965-4985 of
+the plugin), but the c8 staging and HUB1/HUB2 paths should be
+audited.
 
 ### 1.4 `handshake()` (cal_auth) vs `RTS5409S_HID::hub_force_handshake`
 
@@ -1053,6 +1129,28 @@ controller (chip_guid_alt `ea72869e-…`) via the 4CC command interface
 
 ### 5.1 4CC command wire format vs `TPS6598X_API::fourCC_Command`
 
+⚠ **AUDIT CORRECTION 2026-05-13:** the original "wire format: match"
+claim below was wrong. The original audit listed only the 4 high-level
+steps and rubber-stamped the rest. A complete decomp walk of
+`fourCC_Command` at libpdc.c:48780-48995 reveals SEVEN operations the
+function does in steady state, of which we were missing FOUR:
+
+| step | operation                              | matched? |
+|-----:|----------------------------------------|:--------:|
+| 1    | nanosleep(40 ms)  pre-cmd settling     | ✗ → fixed in 80d404024 |
+| 2    | i2c-write reg 0x09 (Data1)             | ✓ |
+| 3    | nanosleep(50 ms) inter-write (FLwd)    | ✗ → fixed in 80d404024 |
+| 4    | i2c-write reg 0x08 (Cmd1)              | ✓ |
+| 5    | nanosleep(5/200 ms) post-cmd settle    | ✗ → fixed in 80d404024 |
+| 6    | poll-loop reading reg 0x08 until done  | ✗ → fixed in 8f28c363e |
+| 7    | i2c-read reg 0x09 (Data1) drain        | ✓ |
+
+Constants verified from libpdc.so rodata at vaddrs 0x193fe0 / 0x193ff0
+/ 0x194000 / 0x194010. The poll-loop check matches
+`status == 0` (success) or `status == 0x444d4321` ("!CMD" error).
+
+Original (incorrect) Section 5.1 below, kept for blame:
+
 *Decomp:* `libpdc.c:48764`. Each 4CC command is a multi-step i2c
 transaction:
 
@@ -1070,6 +1168,13 @@ at `fu-dell-monitor-rt-device.c:1527+`. **Wire format: match —**
 verified end-to-end against pcap. The PDC flow runs fully under
 emulation without skips after commit b48ba060b (per-chunk VerifyFW
 addition).
+
+[NOTE: this "match" verdict was wrong — see correction box above.
+"Verified end-to-end against pcap" tested wire counts only, not
+chip-side responses. The chip's Cmd1 response was consistently
+the still-busy "FLwd" opcode echo on real HW, which the bare-read
+implementation discarded. See feedback memory
+`feedback_re_check_status_register_responses.md`.]
 
 ### 5.2 Region 0 vs Region 1 — single-region vs two-region update
 
@@ -1233,12 +1338,31 @@ half-initialized by a botched prior install.
 
 ### 5.7 Pre-stage IIC open + post-stage close
 
+⚠ **AUDIT CORRECTION 2026-05-13:** the "fwupd's udev backend handles
+this — match" verdict was wrong. The fwupd backend only manages the
+*hidraw fd lifecycle*, not the chip-side session state. The chip's
+secure subsystem requires an explicit `RTS5409S_HID::open()` /
+`::close()` pair that emits chip-side ops (cal_auth, enable_vdcmd,
+enable_high_clock for open; cal_auth, disable_high_clock for close).
+
+Without those ops, the chip nominally treats the privileged-op
+session as still-open after PDC programming completes, and refuses
+the DISPLAY phase's secure_control_gpio commit.
+
+Fixed in commit 2cb52e260 by wrapping `pdc_program` in
+`session_open` / `session_close` calls (which emit the chip-side ops).
+
+Original (incorrect) verdict below for blame:
+
 *Decomp:* `Tps6598xISP::isp` (libpdc.c:50915) opens the IIC
 transport (slot 0x20 or 0x28) before calling `FWUpdate82`. After
 the update, `Tps6598xISP::check_start` closes it.
 
 *We do:* Driven by fwupd's udev backend — no explicit open/close
 needed in the plugin. **Match.**
+
+[NOTE: this "match" verdict conflated host-side fd open/close with
+chip-side session bracket open/close. See correction box above.]
 
 ### Fixes pending
 
