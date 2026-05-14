@@ -2606,8 +2606,35 @@ fu_dell_monitor_rt_device_pdc_program(FuDellMonitorRtDevice *self,
 	 * base+chunk_size..base+(nchunks-1)*chunk_size. Skips chunk 0
 	 * (the header); that goes last. Stops at chunk (nchunks-1) — we
 	 * do NOT emit Wistron's iter-(nchunks) past-end write.
+	 *
+	 * Per-chunk pacing: our op sequence per chunk is byte-for-byte
+	 * identical to Wistron's recap (16 ops: FLwd write+cmd+ack+data,
+	 * 2× FLrd verify, FLad for next chunk). But Wistron's wall-clock
+	 * cadence is ~917 ms/chunk (USB op latency on their QA machine
+	 * was ~55 ms each); ours is ~29 ms/chunk on signi (~1.8 ms per
+	 * USB op). Running 30× faster apparently outruns the TPS6598x's
+	 * flash controller — chip ACKs each i2c op (so our verify reads
+	 * the chip's i2c buffer correctly and matches) but the actual
+	 * flash write hasn't completed before the next FLwd arrives.
+	 * #CHK# returns byte-identical "OK" bytes to Wistron, but the
+	 * staged firmware is silently bad and DISPLAY's 0x04
+	 * secure_control_gpio commit STALLs because the chip's secure
+	 * subsystem detected the bad PDC.
+	 *
+	 * Match Wistron's observed cadence by sleeping ~900 ms per chunk
+	 * before the next FLwd issues. On real HW this makes PDC
+	 * programming take ~7 minutes (matches Wistron's QA timing).
+	 * Skipped under emulation since there's no real flash to
+	 * settle. captures/u4025qw-failrun-20260513-194351.pcapng for
+	 * the chunk-cycle byte-identical comparison.
 	 */
+	const guint pdc_chunk_pacing_us =
+	    fu_device_has_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_EMULATED)
+		? 0
+		: 900 * 1000;
 	for (guint i = 1; i < nchunks; i++) {
+		if (i > 1 && pdc_chunk_pacing_us > 0)
+			g_usleep(pdc_chunk_pacing_us);
 		guint32 addr = base + (guint32)(i * DELL_MONITOR_RT_PDC_CHUNK_SIZE);
 		const guint8 *src = blob_data + (i * DELL_MONITOR_RT_PDC_CHUNK_SIZE);
 		guint8 addr_le[4];
