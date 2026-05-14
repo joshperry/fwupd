@@ -2054,109 +2054,6 @@ fu_dell_monitor_rt_device_enter_bootloader(FuDellMonitorRtDevice *self,
 	return FALSE;
 }
 
-/*
- * Re-acquire the hidraw fd after a USB re-enumeration triggered by
- * 0xE9. The chip drops off the bus, comes back as a NEW kernel
- * device with a NEW /dev/hidrawN node and a NEW sysfs path. Our
- * FuUdevDevice's cached device_file points at the OLD node which is
- * gone — any further IO returns EPROTO/EPIPE.
- *
- * fwupd's standard solution is FWUPD_DEVICE_FLAG_ANOTHER_WRITE_REQUIRED
- * which makes the engine wait for the udev replug, swap in the new
- * FuDevice, and re-run write_firmware. That works but introduces a
- * full engine-level replug cycle (re-probe, re-setup, re-run detach,
- * etc.) which appears to disturb chip-side state on real hardware
- * (DISPLAY block 0's secure_control_gpio commit STALLs even though
- * PDC verify succeeded). Wistron's hidapi-based tool does NOT go
- * through any of that — it just opens a new fd to the same chip and
- * keeps going.
- *
- * This helper does the equivalent: scans /sys/class/hidraw/ for a
- * device matching VID:PID 0bda:1100, updates our FuUdevDevice's
- * device_file to the new node, and reopens the fd. The FuDevice
- * instance, all our cached state, and the chip's session state stay
- * intact across the swap.
- *
- * Polls up to ~5 seconds for the new device to appear.
- */
-static gboolean
-fu_dell_monitor_rt_device_reacquire_hidraw(FuDellMonitorRtDevice *self,
-					   guint16 expected_vid,
-					   guint16 expected_pid,
-					   GError **error)
-{
-	g_autofree gchar *target_hid_id =
-	    g_strdup_printf("HID_ID=0003:%08X:%08X",
-			    (guint)expected_vid,
-			    (guint)expected_pid);
-	const gchar *old_path =
-	    fu_udev_device_get_device_file(FU_UDEV_DEVICE(self));
-	g_autofree gchar *old_path_dup = g_strdup(old_path);
-
-	/* Under emulation no real re-enum happens — skip the sysfs scan
-	 * entirely so we don't accidentally swap the synthetic device's
-	 * device_file to a real Dell hidraw on the bus. */
-	if (fu_device_has_flag(FU_DEVICE(self), FWUPD_DEVICE_FLAG_EMULATED))
-		return TRUE;
-
-	for (guint attempt = 0; attempt < 50; attempt++) { /* 50 × 100 ms = 5 s */
-		g_autoptr(GDir) dir = NULL;
-		const gchar *name;
-
-		g_usleep(100 * 1000);
-
-		dir = g_dir_open("/sys/class/hidraw", 0, NULL);
-		if (dir == NULL)
-			continue;
-
-		while ((name = g_dir_read_name(dir)) != NULL) {
-			g_autofree gchar *uevent_path =
-			    g_strdup_printf("/sys/class/hidraw/%s/device/uevent",
-					    name);
-			g_autofree gchar *uevent = NULL;
-			g_autofree gchar *new_devfile = NULL;
-
-			if (!g_file_get_contents(uevent_path, &uevent, NULL, NULL))
-				continue;
-			if (g_strstr_len(uevent, -1, target_hid_id) == NULL)
-				continue;
-
-			new_devfile = g_strdup_printf("/dev/%s", name);
-			/* Skip if we'd reopen the same path — chip hasn't
-			 * re-enumerated yet, keep polling. */
-			if (g_strcmp0(new_devfile, old_path_dup) == 0)
-				goto next_attempt;
-
-			g_info("dell-monitor-rt: post-0xE9 re-enum detected, "
-			       "swapping hidraw %s → %s",
-			       old_path_dup,
-			       new_devfile);
-			if (!fu_device_close(FU_DEVICE(self), error)) {
-				g_prefix_error(error, "close old hidraw: ");
-				return FALSE;
-			}
-			fu_udev_device_set_device_file(FU_UDEV_DEVICE(self),
-						       new_devfile);
-			if (!fu_device_open(FU_DEVICE(self), error)) {
-				g_prefix_error(error,
-					       "open new hidraw %s: ",
-					       new_devfile);
-				return FALSE;
-			}
-			return TRUE;
-		}
-	next_attempt:;
-	}
-	g_set_error(error,
-		    FWUPD_ERROR,
-		    FWUPD_ERROR_TIMED_OUT,
-		    "post-0xE9 re-acquire timed out: no new hidraw matching "
-		    "%04x:%04x appeared within 5 s",
-		    expected_vid,
-		    expected_pid);
-	return FALSE;
-}
-
 /* ----- TI TPS6598x 4CC command primitives -------------------------
  *
  * The PDC component (TI TPS6598x USB-C Power Delivery controller) is
@@ -5292,35 +5189,57 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 #define DELL_MONITOR_RT_POST_BOOTLOADER_PHASES 2
 #define DELL_MONITOR_RT_NUM_PASSES                                                                 \
 	(DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES + DELL_MONITOR_RT_POST_BOOTLOADER_PHASES)
-		/* Pre-install IspTag announcement: Wistron writes
-		 * "#ISP#<new_version>#" to VCP 0xAD twice back-to-back
-		 * before any flashing begins (recap frames 7230 and 7264).
-		 * Tells the chip the target version of the in-progress
-		 * update so it can later verify the staged firmware
-		 * against it when "#CHK#<new_version>#" arrives post-PDC.
-		 * The duplicate write matches Wistron's exact emission
-		 * pattern. */
-		{
-			const gchar *new_version =
-			    fu_dell_monitor_rt_firmware_get_fw_version(fw_container);
-			if (new_version != NULL) {
-				for (guint k = 0; k < 2; k++) {
-					if (!fu_dell_monitor_rt_device_commit_isp_tag(
-						self,
-						"ISP",
-						new_version,
-						error)) {
-						g_prefix_error(
-						    error,
-						    "pre-install IspTag "
-						    "announcement #%u: ",
-						    k + 1);
-						return FALSE;
+		/* Iteration 1 runs passes 0..PRE_BL_PASSES-1 (pre-bootloader);
+		 * iteration 2 (PRE_BL_DONE flag set) runs passes PRE_BL_PASSES..
+		 * NUM_PASSES-1 (post-bootloader). The route walker's filter
+		 * logic already discriminates by `route.kind` and `phase_order`
+		 * — limiting the loop range here just skips the irrelevant
+		 * passes early. */
+		guint pass_lo, pass_hi;
+		if (fu_device_has_private_flag(
+			device,
+			FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE)) {
+			pass_lo = DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES;
+			pass_hi = DELL_MONITOR_RT_NUM_PASSES;
+		} else {
+			pass_lo = 0;
+			pass_hi = DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES;
+
+			/* Pre-install IspTag announcement (iteration 1 only).
+			 * Wistron writes "#ISP#<new_version>#" to VCP 0xAD
+			 * twice back-to-back before any flashing begins
+			 * (recap frames 7230 and 7264). This tells the chip
+			 * the target version of the in-progress update so it
+			 * can later verify the staged firmware against it
+			 * when "#CHK#<new_version>#" arrives post-PDC.
+			 * Without this pair the chip rejects the post-PDC
+			 * commit and stalls DISPLAY block 0. The duplicate
+			 * write matches Wistron's exact emission pattern —
+			 * defensive or paired-protocol, unclear, but cheap
+			 * to mirror. */
+			{
+				const gchar *new_version =
+				    fu_dell_monitor_rt_firmware_get_fw_version(
+					fw_container);
+				if (new_version != NULL) {
+					for (guint k = 0; k < 2; k++) {
+						if (!fu_dell_monitor_rt_device_commit_isp_tag(
+							self,
+							"ISP",
+							new_version,
+							error)) {
+							g_prefix_error(
+							    error,
+							    "pre-install IspTag "
+							    "announcement #%u: ",
+							    k + 1);
+							return FALSE;
+						}
 					}
 				}
 			}
 		}
-		for (guint pass = 0; pass < DELL_MONITOR_RT_NUM_PASSES; pass++) {
+		for (guint pass = pass_lo; pass < pass_hi; pass++) {
 			components = fu_firmware_get_images(firmware);
 			for (guint i = 0; i < components->len; i++) {
 				FuDellMonitorRtFirmwareComponent *component =
@@ -5477,28 +5396,23 @@ fu_dell_monitor_rt_device_write_firmware(FuDevice *device,
 					       (unsigned)route.usb_pid);
 				}
 			}
+		}
 
-			/* If we just finished the last pre-bootloader pass,
-			 * the chip is mid-re-enumeration from the 0xE9 we
-			 * just fired. Manually re-acquire the primary's
-			 * hidraw fd by scanning sysfs for the new node —
-			 * keeps us in the same write_firmware call (and the
-			 * same chip-side session) without going through
-			 * fwupd's engine-level replug, which appears to
-			 * disturb chip-side state and STALL the DISPLAY
-			 * commit on real hardware. */
-			if (pass + 1 == DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES) {
-				g_info("dell-monitor-rt: pre-bootloader passes "
-				       "complete; re-acquiring primary hidraw "
-				       "after 0xE9 re-enum");
-				if (!fu_dell_monitor_rt_device_reacquire_hidraw(
-					self, 0x0bda, primary_pid, error)) {
-					g_prefix_error(error,
-						       "post-0xE9 hidraw "
-						       "re-acquire: ");
-					return FALSE;
-				}
-			}
+		/* If we just finished the pre-bootloader passes, mark
+		 * the stage as done and ask the engine to come back for
+		 * another write_firmware iteration after the device
+		 * re-enumerates (forced by the 0xE9 we just fired). The
+		 * second iteration will run the post-bootloader passes
+		 * with a fresh hidraw fd. */
+		if (pass_hi == DELL_MONITOR_RT_PRE_BOOTLOADER_PASSES) {
+			fu_device_add_private_flag(
+			    device,
+			    FU_DELL_MONITOR_RT_FLAG_PRE_BL_DONE);
+			fu_device_add_flag(device,
+					   FWUPD_DEVICE_FLAG_ANOTHER_WRITE_REQUIRED);
+			g_info("dell-monitor-rt: pre-bootloader complete; "
+			       "yielding for replug + post-bootloader "
+			       "iteration");
 		}
 	}
 
