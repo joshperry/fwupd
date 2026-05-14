@@ -4875,10 +4875,42 @@ fu_dell_monitor_rt_proto_pdc_stage(FuDellMonitorRtDevice *target,
 	fu_dell_monitor_rt_get_synkey(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED,
 				      sizeof(DELL_MONITOR_RT_U4025QW_SYNKEY_SEED),
 				      hub_key);
-	if (!fu_dell_monitor_rt_device_handshake(target, hub_key, error))
+	/* Wrap the entire PDC program in a session_open / session_close pair
+	 * to mirror RTS5409S_HID::open() and ::close() in libdevices.c (open
+	 * around line 66951 — enable_vdcmd + enable_high_clock + cal_auth;
+	 * close around line 66554 — cal_auth + disable_high_clock).
+	 *
+	 * Wistron does these two as a strict bracket: the chip's secure
+	 * subsystem treats the session as bound to the cal_auth handshake at
+	 * open. Closing the session with a fresh cal_auth + disable_high_clock
+	 * is the chip's signal that the privileged 4CC ops (FLem/FLwd/FLvy)
+	 * are done, after which the chip is willing to accept the DISPLAY
+	 * phase's secure_control_gpio commit.
+	 *
+	 * Real-HW evidence from
+	 * captures/u4025qw-failrun-20260513-210753.pcapng vs the recap: the
+	 * 3 ops `40 e1 01 01`, `40 e1 03 00`, `40 06 00 00` (cal_auth req,
+	 * cal_auth resp, disable_high_clock) appear in recap immediately
+	 * after FLvy success — the close sequence — and we were skipping
+	 * them. DISPLAY block 0's 0x04 secure_control_gpio commit STALLed
+	 * with EPIPE because the chip refused secure ops while the PDC
+	 * session was still nominally open.
+	 *
+	 * Previously we only called handshake (cal_auth) before pdc_program
+	 * — half the open sequence and no close. */
+	if (!fu_dell_monitor_rt_device_session_open(target, hub_key, error)) {
+		g_prefix_error(error, "PDC session_open: ");
 		return FALSE;
-	if (!fu_dell_monitor_rt_device_pdc_program(target, blob, NULL, error))
+	}
+	if (!fu_dell_monitor_rt_device_pdc_program(target, blob, NULL, error)) {
+		g_autoptr(GError) ignored = NULL;
+		fu_dell_monitor_rt_device_session_close(target, hub_key, &ignored);
 		return FALSE;
+	}
+	if (!fu_dell_monitor_rt_device_session_close(target, hub_key, error)) {
+		g_prefix_error(error, "PDC session_close: ");
+		return FALSE;
+	}
 
 	/* Post-PDC: read VCP 0xCC. Wistron emits this in its own
 	 * session bracket between PDC's last 4CC and the #CHK# write.
